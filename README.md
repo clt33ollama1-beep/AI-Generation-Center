@@ -44,7 +44,10 @@ A self-hosted **AI Generation Centre** for orchestrating remote [ComfyUI](https:
    ```env
    COMFYUI_URL=http://192.168.1.100:8188
    DATA_DIR=/app/data
+   FRONTEND_PORT=3000
+   BACKEND_PORT=8000
    ```
+   *(If port `8000` or `3000` is already allocated on your host, set `BACKEND_PORT=8001` or `FRONTEND_PORT=3001` in `.env`—Nginx proxies `/api` to `backend:8000` over the internal Docker network regardless of host port.)*
 
 2. **Build and start the stack:**
    ```bash
@@ -52,8 +55,8 @@ A self-hosted **AI Generation Centre** for orchestrating remote [ComfyUI](https:
    ```
 
 3. **Access the application:**
-   - **Web UI:** `http://localhost:3000`
-   - **FastAPI Backend / OpenAPI Docs:** `http://localhost:8000/docs`
+   - **Web UI:** `http://localhost:3000` (or `FRONTEND_PORT`)
+   - **FastAPI Backend / OpenAPI Docs:** `http://localhost:8000/docs` (or `BACKEND_PORT`)
 
 4. **Data Persistence:**
    The `./data` directory on your host is mounted into `/app/data` inside the `backend` container:
