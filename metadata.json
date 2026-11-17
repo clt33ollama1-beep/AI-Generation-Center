@@ -1,0 +1,6 @@
+{
+  "name": "ComfyCentre",
+  "description": "Self-hosted AI Generation Centre for orchestrating remote ComfyUI image and video workflows with schema-driven templates and real-time SSE progress.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

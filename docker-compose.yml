@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: comfycentre-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - COMFYUI_URL=${COMFYUI_URL:-http://192.168.1.100:8188}
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    container_name: comfycentre-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
