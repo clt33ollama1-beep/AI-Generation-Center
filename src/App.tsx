@@ -14,12 +14,25 @@ function getInitialRoute(): AppRoute {
   return '/';
 }
 
+function getInitialWorkflowId(): number | null {
+  try {
+    const saved = window.localStorage.getItem('comfycentre:selected_workflow_id');
+    if (saved) {
+      const parsed = Number(saved);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return null;
+}
+
 export default function App() {
   const [route, setRoute] = useState<AppRoute>(getInitialRoute);
   const [categories, setCategories] = useState<Category[]>([]);
   const [workflows, setWorkflows] = useState<WorkflowTemplate[]>([]);
   const [generations, setGenerations] = useState<GenerationRecord[]>([]);
-  const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null);
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(getInitialWorkflowId);
   const [prefilledInputs, setPrefilledInputs] = useState<Record<string, unknown> | null>(null);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [createTemplateTrigger, setCreateTemplateTrigger] = useState(0);
@@ -54,6 +67,16 @@ export default function App() {
       return wfs[0]?.id ?? null;
     });
   }, []);
+
+  useEffect(() => {
+    if (selectedWorkflowId !== null) {
+      try {
+        window.localStorage.setItem('comfycentre:selected_workflow_id', String(selectedWorkflowId));
+      } catch {
+        // ignore storage errors
+      }
+    }
+  }, [selectedWorkflowId]);
 
   useEffect(() => {
     void refreshAll().finally(() => setLoading(false));
@@ -95,6 +118,7 @@ export default function App() {
                 setPrefilledInputs(null);
                 setSelectedWorkflowId(id);
               }}
+              onClearPrefilled={() => setPrefilledInputs(null)}
               onOpenConnection={() => setConnectionOpen(true)}
               onGenerationComplete={(gen) => {
                 setGenerations((prev) => [gen, ...prev]);

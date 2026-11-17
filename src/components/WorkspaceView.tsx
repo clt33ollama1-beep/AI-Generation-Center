@@ -28,9 +28,44 @@ interface WorkspaceViewProps {
   selectedWorkflowId: number | null;
   prefilledInputs?: Record<string, unknown> | null;
   onSelectWorkflow: (id: number) => void;
+  onClearPrefilled?: () => void;
   onOpenConnection: () => void;
   onGenerationComplete: (generation: GenerationRecord) => void;
   onGoTemplates: () => void;
+}
+
+const DRAFT_STORAGE_PREFIX = 'comfycentre:draft:';
+
+interface StoredWorkflowDraft {
+  values?: Record<string, string | number | boolean>;
+  seedLocks?: Record<string, boolean>;
+}
+
+function loadWorkflowDraft(workflowId: number): StoredWorkflowDraft | null {
+  try {
+    const raw = window.localStorage.getItem(`${DRAFT_STORAGE_PREFIX}${workflowId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredWorkflowDraft;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWorkflowDraft(workflowId: number, draft: StoredWorkflowDraft): void {
+  try {
+    window.localStorage.setItem(`${DRAFT_STORAGE_PREFIX}${workflowId}`, JSON.stringify(draft));
+  } catch {
+    // ignore storage quota/privacy errors
+  }
+}
+
+function clearWorkflowDraft(workflowId: number): void {
+  try {
+    window.localStorage.removeItem(`${DRAFT_STORAGE_PREFIX}${workflowId}`);
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
@@ -39,6 +74,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   selectedWorkflowId,
   prefilledInputs,
   onSelectWorkflow,
+  onClearPrefilled,
   onOpenConnection,
   onGenerationComplete,
   onGoTemplates,
@@ -67,21 +103,36 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     return workflows.find((w) => w.id === selectedWorkflowId) || workflows[0];
   }, [workflows, selectedWorkflowId]);
 
-  // Initialize form values when active workflow or prefilledInputs changes
+  // Initialize form values when active workflow or prefilledInputs changes,
+  // restoring any saved localStorage draft for the workflow.
   useEffect(() => {
     if (!activeWorkflow) return;
-    const defaults: Record<string, string | number | boolean> = {};
+    const draft = loadWorkflowDraft(activeWorkflow.id);
+    const initialValues: Record<string, string | number | boolean> = {};
+
     for (const field of activeWorkflow.ui_inputs) {
       const key = `${field.node_id}:${field.field_name}`;
-      if (prefilledInputs && key in prefilledInputs) {
-        defaults[key] = prefilledInputs[key] as string | number | boolean;
+      if (prefilledInputs && key in prefilledInputs && field.value_type !== 'media') {
+        initialValues[key] = prefilledInputs[key] as string | number | boolean;
+      } else if (draft?.values && key in draft.values && field.value_type !== 'media') {
+        initialValues[key] = draft.values[key];
       } else {
-        defaults[key] = field.default_value;
+        initialValues[key] = field.default_value;
       }
     }
-    setFormValues(defaults);
+
+    const nextSeedLocks = draft?.seedLocks ? { ...draft.seedLocks } : {};
+    setFormValues(initialValues);
+    setSeedLocks(nextSeedLocks);
     setFileValues({});
     setRunError(null);
+
+    if (prefilledInputs) {
+      saveWorkflowDraft(activeWorkflow.id, {
+        values: initialValues,
+        seedLocks: nextSeedLocks,
+      });
+    }
   }, [activeWorkflow, prefilledInputs]);
 
   useEffect(() => {
@@ -115,7 +166,10 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     for (const field of activeWorkflow.ui_inputs) {
       defaults[`${field.node_id}:${field.field_name}`] = field.default_value;
     }
+    clearWorkflowDraft(activeWorkflow.id);
+    onClearPrefilled?.();
     setFormValues(defaults);
+    setSeedLocks({});
     setFileValues({});
     setRunError(null);
   };
@@ -133,6 +187,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
       }
     }
     setFormValues(nextValues);
+    saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks });
 
     const clientId = crypto.randomUUID();
     setIsRunning(true);
@@ -365,17 +420,31 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                       onToggleSeedLock={
                         field.widget === 'seed_randomizer'
                           ? () =>
-                              setSeedLocks((prev) => ({
-                                ...prev,
-                                [key]: !prev[key],
-                              }))
+                              setSeedLocks((prev) => {
+                                const next = {
+                                  ...prev,
+                                  [key]: !prev[key],
+                                };
+                                saveWorkflowDraft(activeWorkflow.id, {
+                                  values: formValues,
+                                  seedLocks: next,
+                                });
+                                return next;
+                              })
                           : undefined
                       }
                       onChange={(val) =>
-                        setFormValues((prev) => ({
-                          ...prev,
-                          [key]: val,
-                        }))
+                        setFormValues((prev) => {
+                          const next = {
+                            ...prev,
+                            [key]: val,
+                          };
+                          saveWorkflowDraft(activeWorkflow.id, {
+                            values: next,
+                            seedLocks,
+                          });
+                          return next;
+                        })
                       }
                       onFileChange={(file) =>
                         setFileValues((prev) => ({

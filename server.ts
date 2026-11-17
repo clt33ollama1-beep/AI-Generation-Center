@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -20,7 +21,7 @@ import type {
   WidgetType,
 } from './src/types/comfy.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = 3000;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
 const OUTPUTS_DIR = path.join(DATA_DIR, 'outputs');
 const DB_PATH = path.join(DATA_DIR, 'db.sqlite');
@@ -1018,9 +1019,14 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
 });
 
 async function startServer() {
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1032,7 +1038,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`ComfyCentre listening on http://0.0.0.0:${PORT} (ComfyUI: ${getComfyUiUrl()})`);
   });
 }
