@@ -54,7 +54,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
     output_type TEXT NOT NULL DEFAULT 'auto',
     comfy_api_json TEXT NOT NULL,
     ui_inputs_json TEXT NOT NULL,
@@ -91,11 +91,29 @@ if (!generationCols.some((c) => c.name === 'input_media_json')) {
 }
 
 function slugify(value: string): string {
-  return value
+  const ascii = value
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'category';
+    .replace(/^-+|-+$/g, '');
+  if (ascii) return ascii;
+  const hash = crypto.createHash('sha1').update(value.trim()).digest('hex').slice(0, 8);
+  return `category-${hash}`;
+}
+
+function getOrCreateUncategorizedCategoryId(): number {
+  const existing = db
+    .prepare("SELECT id FROM categories WHERE slug = 'uncategorized' OR lower(name) = 'uncategorized' LIMIT 1")
+    .get() as { id: number } | undefined;
+  if (existing) {
+    return Number(existing.id);
+  }
+  const result = db
+    .prepare(
+      'INSERT INTO categories (name, slug, description, sort_order) VALUES (?, ?, ?, ?)',
+    )
+    .run('Uncategorized', 'uncategorized', 'Workflows from deleted or unassigned categories', 999);
+  return Number(result.lastInsertRowid);
 }
 
 function safeDirSegment(value: string, fallback = 'uncategorized'): string {
@@ -603,24 +621,72 @@ app.put('/api/categories/:id', (req: Request, res: Response) => {
     return;
   }
   const name = String(req.body?.name ?? existing.name).trim();
+  if (!name) {
+    res.status(400).json({ detail: 'Category name is required' });
+    return;
+  }
   const description = String(req.body?.description ?? existing.description).trim();
   const sortOrder = Number(req.body?.sort_order ?? existing.sort_order);
   const slug = slugify(name);
-  db.prepare(
-    'UPDATE categories SET name = ?, slug = ?, description = ?, sort_order = ? WHERE id = ?',
-  ).run(name, slug, description, sortOrder, id);
-  const updated = db.prepare('SELECT * FROM categories WHERE id = ?').get(id);
-  res.json(updated);
+  try {
+    db.prepare(
+      'UPDATE categories SET name = ?, slug = ?, description = ?, sort_order = ? WHERE id = ?',
+    ).run(name, slug, description, sortOrder, id);
+    const updated = db.prepare('SELECT * FROM categories WHERE id = ?').get(id);
+    res.json(updated);
+  } catch (err) {
+    res.status(409).json({
+      detail: err instanceof Error ? err.message : 'Category name already exists',
+    });
+  }
 });
 
 app.delete('/api/categories/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
-  const result = db.prepare('DELETE FROM categories WHERE id = ?').run(id);
-  if (result.changes === 0) {
+  const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as
+    | { id: number; name: string; slug: string }
+    | undefined;
+  if (!existing) {
     res.status(404).json({ detail: 'Category not found' });
     return;
   }
-  res.json({ deleted: true });
+
+  const wfCountRow = db
+    .prepare('SELECT COUNT(*) AS count FROM workflows WHERE category_id = ?')
+    .get(id) as { count: number };
+  const wfCount = Number(wfCountRow?.count || 0);
+
+  const isUncategorized =
+    String(existing.slug).toLowerCase() === 'uncategorized' ||
+    String(existing.name).trim().toLowerCase() === 'uncategorized';
+
+  const totalCatRow = db.prepare('SELECT COUNT(*) AS count FROM categories').get() as {
+    count: number;
+  };
+  if (isUncategorized && (wfCount > 0 || Number(totalCatRow?.count || 0) <= 1)) {
+    res.status(400).json({
+      detail: 'Cannot delete the Uncategorized category while templates use it or no other categories exist',
+    });
+    return;
+  }
+
+  let uncategorizedId: number | null = null;
+  if (wfCount > 0 || Number(totalCatRow?.count || 0) <= 1) {
+    uncategorizedId = getOrCreateUncategorizedCategoryId();
+    if (wfCount > 0) {
+      db.prepare("UPDATE workflows SET category_id = ?, updated_at = datetime('now') WHERE category_id = ?").run(
+        uncategorizedId,
+        id,
+      );
+    }
+  }
+
+  db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+  res.json({
+    deleted: true,
+    reassigned_count: wfCount,
+    uncategorized_category_id: uncategorizedId,
+  });
 });
 
 // Workflow Inspector

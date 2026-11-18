@@ -46,8 +46,22 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  updateCategory: (
+    id: number,
+    payload: { name?: string; description?: string; sort_order?: number },
+  ) =>
+    requestJson<Category>(`/api/categories/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
   deleteCategory: (id: number) =>
-    requestJson<{ deleted: boolean }>(`/api/categories/${id}`, { method: 'DELETE' }),
+    requestJson<{
+      deleted: boolean;
+      reassigned_count?: number;
+      uncategorized_category_id?: number | null;
+    }>(`/api/categories/${id}`, { method: 'DELETE' }),
 
   listWorkflows: () => requestJson<WorkflowTemplate[]>('/api/workflows'),
 

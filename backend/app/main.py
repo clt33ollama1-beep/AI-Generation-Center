@@ -72,9 +72,34 @@ app.add_middleware(
 app.mount("/outputs", StaticFiles(directory=str(settings.outputs_path)), name="outputs")
 
 
+import hashlib
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower().strip()).strip("-")
-    return slug or "category"
+    if slug:
+        return slug
+    digest = hashlib.sha1(value.strip().encode("utf-8")).hexdigest()[:8]
+    return f"category-{digest}"
+
+
+def get_or_create_uncategorized_category_id(session: Session) -> int:
+    existing = session.exec(
+        select(Category).where(
+            (Category.slug == "uncategorized") | (Category.name == "Uncategorized")
+        )
+    ).first()
+    if existing and existing.id is not None:
+        return existing.id
+    uncat = Category(
+        name="Uncategorized",
+        slug="uncategorized",
+        description="Workflows from deleted or unassigned categories",
+        sort_order=999,
+    )
+    session.add(uncat)
+    session.commit()
+    session.refresh(uncat)
+    return int(uncat.id or 0)
 
 
 def get_comfyui_url(session: Session) -> str:
@@ -195,15 +220,22 @@ def update_category(
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
     if payload.name is not None:
-        cat.name = payload.name.strip()
-        cat.slug = slugify(cat.name)
+        cleaned_name = payload.name.strip()
+        if not cleaned_name:
+            raise HTTPException(status_code=400, detail="Category name is required")
+        cat.name = cleaned_name
+        cat.slug = slugify(cleaned_name)
     if payload.description is not None:
         cat.description = payload.description.strip()
     if payload.sort_order is not None:
         cat.sort_order = payload.sort_order
     session.add(cat)
-    session.commit()
-    session.refresh(cat)
+    try:
+        session.commit()
+        session.refresh(cat)
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return CategoryRead(**cat.model_dump())
 
 
@@ -212,9 +244,37 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
     cat = session.get(Category, category_id)
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+
+    affected_workflows = session.exec(
+        select(WorkflowTemplate).where(WorkflowTemplate.category_id == category_id)
+    ).all()
+    wf_count = len(affected_workflows)
+    total_categories = len(session.exec(select(Category)).all())
+    is_uncategorized = (
+        cat.slug.lower() == "uncategorized" or cat.name.strip().lower() == "uncategorized"
+    )
+    if is_uncategorized and (wf_count > 0 or total_categories <= 1):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete the Uncategorized category while templates use it or no other categories exist",
+        )
+
+    uncat_id: Optional[int] = None
+    if wf_count > 0 or total_categories <= 1:
+        uncat_id = get_or_create_uncategorized_category_id(session)
+        for wf in affected_workflows:
+            wf.category_id = uncat_id
+            wf.updated_at = utcnow_iso()
+            session.add(wf)
+        session.flush()
+
     session.delete(cat)
     session.commit()
-    return {"deleted": True}
+    return {
+        "deleted": True,
+        "reassigned_count": wf_count,
+        "uncategorized_category_id": uncat_id,
+    }
 
 
 @app.post("/api/workflows/inspect", response_model=WorkflowInspectResponse)

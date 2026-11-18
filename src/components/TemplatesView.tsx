@@ -4,10 +4,12 @@ import {
   Check,
   FileJson,
   FolderPlus,
+  Pencil,
   Plus,
   Save,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import { api } from '../lib/api.ts';
 import type {
@@ -65,6 +67,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
 
   const [newCategoryName, setNewCategoryName] = useState('');
   const [addingCategory, setAddingCategory] = useState(false);
+  const [editingCatId, setEditingCatId] = useState<number | null>(null);
+  const [editingCatName, setEditingCatName] = useState('');
+  const [confirmDeleteCatId, setConfirmDeleteCatId] = useState<number | null>(null);
   const [inspecting, setInspecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -382,10 +387,56 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     }
   };
 
-  const handleDeleteCategory = async (id: number) => {
+  const handleStartEditCategory = (cat: Category) => {
+    setConfirmDeleteCatId(null);
+    setEditingCatId(cat.id);
+    setEditingCatName(cat.name);
+    setError(null);
+  };
+
+  const handleSaveCategoryEdit = async (e: React.FormEvent, id: number) => {
+    e.preventDefault();
+    const trimmed = editingCatName.trim();
+    if (!trimmed) {
+      setError('Category name is required');
+      return;
+    }
     try {
-      await api.deleteCategory(id);
+      setError(null);
+      const updated = await api.updateCategory(id, { name: trimmed });
+      setEditingCatId(null);
+      setEditingCatName('');
       await onRefreshData();
+      setNotice(`Updated category to "${updated.name}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update category');
+    }
+  };
+
+  const handleDeleteCategory = async (cat: Category) => {
+    try {
+      setError(null);
+      const result = await api.deleteCategory(cat.id);
+      setConfirmDeleteCatId(null);
+      if (editingCatId === cat.id) {
+        setEditingCatId(null);
+      }
+      await onRefreshData();
+      if (categoryId === cat.id) {
+        if (result.uncategorized_category_id) {
+          setCategoryId(result.uncategorized_category_id);
+        } else {
+          const fallback = categories.find((c) => c.id !== cat.id);
+          setCategoryId(fallback?.id || 0);
+        }
+      }
+      if ((result.reassigned_count || 0) > 0) {
+        setNotice(
+          `Deleted category "${cat.name}" and moved ${result.reassigned_count} template(s) to "Uncategorized".`,
+        );
+      } else {
+        setNotice(`Deleted category "${cat.name}".`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete category');
     }
@@ -410,21 +461,120 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
         <div className="flex-1 overflow-y-auto p-3 space-y-5">
           {categories.map((cat) => {
             const catWorkflows = workflows.filter((w) => w.category_id === cat.id);
+            const isUncategorized =
+              cat.slug.toLowerCase() === 'uncategorized' ||
+              cat.name.trim().toLowerCase() === 'uncategorized';
+            const canDeleteCategory =
+              !(isUncategorized && (catWorkflows.length > 0 || categories.length <= 1));
+            const isEditingThisCat = editingCatId === cat.id;
+            const isConfirmingDelete = confirmDeleteCatId === cat.id;
+
             return (
               <div key={cat.id} className="space-y-1.5">
-                <div className="flex items-center justify-between px-2 text-xs">
-                  <span className="font-medium text-zinc-400 truncate">{cat.name}</span>
-                  {catWorkflows.length === 0 && categories.length > 1 && (
+                {isEditingThisCat ? (
+                  <form
+                    onSubmit={(e) => void handleSaveCategoryEdit(e, cat.id)}
+                    className="flex items-center gap-1 px-1"
+                  >
+                    <input
+                      type="text"
+                      autoFocus
+                      value={editingCatName}
+                      onChange={(e) => setEditingCatName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          setEditingCatId(null);
+                        }
+                      }}
+                      aria-label="Edit category name"
+                      className="flex-1 min-w-0 px-2 py-1 text-xs bg-[#0B0D11] border border-blue-500 rounded text-zinc-100 focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      title="Save category name"
+                      aria-label="Save category name"
+                      className="p-1 text-emerald-400 hover:bg-zinc-800 rounded cursor-pointer shrink-0"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                    </button>
                     <button
                       type="button"
-                      onClick={() => void handleDeleteCategory(cat.id)}
-                      title="Delete empty category"
-                      className="text-zinc-600 hover:text-red-400 transition-colors cursor-pointer"
+                      onClick={() => setEditingCatId(null)}
+                      title="Cancel"
+                      aria-label="Cancel category edit"
+                      className="p-1 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded cursor-pointer shrink-0"
                     >
-                      <Trash2 className="w-3 h-3" />
+                      <X className="w-3.5 h-3.5" />
                     </button>
-                  )}
-                </div>
+                  </form>
+                ) : (
+                  <div className="group/cat flex items-center justify-between gap-2 px-2 text-xs">
+                    <span className="font-medium text-zinc-400 truncate">
+                      {cat.name}
+                      <span className="ml-1.5 font-mono text-[11px] text-zinc-600 tabular-nums">
+                        {catWorkflows.length}
+                      </span>
+                    </span>
+                    <div className="flex items-center gap-1 opacity-70 group-hover/cat:opacity-100 transition-opacity shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleStartEditCategory(cat)}
+                        title={`Edit category "${cat.name}"`}
+                        aria-label={`Edit category ${cat.name}`}
+                        className="p-1 text-zinc-500 hover:text-zinc-200 rounded hover:bg-zinc-800/80 transition-colors cursor-pointer"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
+                      {canDeleteCategory && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (catWorkflows.length > 0) {
+                              setEditingCatId(null);
+                              setConfirmDeleteCatId(isConfirmingDelete ? null : cat.id);
+                            } else {
+                              void handleDeleteCategory(cat);
+                            }
+                          }}
+                          title={
+                            catWorkflows.length > 0
+                              ? `Delete "${cat.name}" and move templates to Uncategorized`
+                              : `Delete category "${cat.name}"`
+                          }
+                          aria-label={`Delete category ${cat.name}`}
+                          className="p-1 text-zinc-500 hover:text-red-400 rounded hover:bg-zinc-800/80 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {isConfirmingDelete && (
+                  <div className="mx-1 p-2 rounded border border-amber-800/60 bg-amber-950/30 text-[11px] space-y-1.5">
+                    <p className="text-amber-200 leading-snug">
+                      Delete "{cat.name}" and move {catWorkflows.length} template
+                      {catWorkflows.length > 1 ? 's' : ''} to Uncategorized?
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteCategory(cat)}
+                        className="px-2 py-1 text-[11px] font-medium bg-red-600 hover:bg-red-500 text-white rounded cursor-pointer"
+                      >
+                        Move & Delete
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteCatId(null)}
+                        className="px-2 py-1 text-[11px] font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 <div className="space-y-1">
                   {catWorkflows.length === 0 ? (

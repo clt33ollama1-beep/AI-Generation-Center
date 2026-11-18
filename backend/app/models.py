@@ -31,7 +31,7 @@ class WorkflowTemplate(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     description: str = Field(default="")
-    category_id: int = Field(foreign_key="categories.id", ondelete="CASCADE")
+    category_id: int = Field(foreign_key="categories.id")
     output_type: str = Field(default="auto")
     output_node_ids_json: str = Field(default="[]")
     comfy_api_json: str
