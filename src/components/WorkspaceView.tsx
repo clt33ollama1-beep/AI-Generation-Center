@@ -97,15 +97,15 @@ function clearWorkflowDraft(workflowId: number): void {
 }
 
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
-  categories,
-  workflows,
+  categories = [],
+  workflows = [],
   selectedWorkflowId,
   prefilledGeneration,
   onSelectWorkflow,
   onClearPrefilled,
   onOpenConnection,
   onGoTemplates,
-  queueTasks,
+  queueTasks = [],
   isQueueRunning,
   selectedOutputTaskId,
   onSelectOutputTask,
@@ -130,10 +130,14 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [queuedFeedback, setQueuedFeedback] = useState<string | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
 
+  const safeCategories = Array.isArray(categories) ? categories : [];
+  const safeWorkflows = Array.isArray(workflows) ? workflows : [];
+  const safeQueueTasks = Array.isArray(queueTasks) ? queueTasks : [];
+
   const activeWorkflow = useMemo(() => {
-    if (workflows.length === 0) return null;
-    return workflows.find((w) => w.id === selectedWorkflowId) || workflows[0];
-  }, [workflows, selectedWorkflowId]);
+    if (safeWorkflows.length === 0) return null;
+    return safeWorkflows.find((w) => w.id === selectedWorkflowId) || safeWorkflows[0];
+  }, [safeWorkflows, selectedWorkflowId]);
 
   // Initialize form values when active workflow or prefilledGeneration changes,
   // restoring any saved localStorage draft for the workflow.
@@ -217,9 +221,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   const groupedWorkflows = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return categories
+    return safeCategories
       .map((cat) => {
-        const items = workflows.filter((w) => {
+        const items = safeWorkflows.filter((w) => {
           if (w.category_id !== cat.id) return false;
           if (!q) return true;
           return (
@@ -231,7 +235,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
         return { category: cat, items };
       })
       .filter((group) => group.items.length > 0 || !q);
-  }, [categories, workflows, searchQuery]);
+  }, [safeCategories, safeWorkflows, searchQuery]);
 
   const handleResetDefaults = () => {
     if (!activeWorkflow) return;
@@ -275,7 +279,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     const nextValues = prepareSubmissionValues();
     if (!nextValues) return;
 
-    const alreadyRunning = queueTasks.some((t) => t.status === 'running');
+    const alreadyRunning = safeQueueTasks.some((t) => t.status === 'running');
     onEnqueueTask({
       workflow: activeWorkflow,
       values: nextValues,
@@ -305,37 +309,37 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   const sortedFields = useMemo(() => {
     if (!activeWorkflow) return [];
-    return [...activeWorkflow.ui_inputs].sort((a, b) => a.order - b.order);
+    return [...(activeWorkflow.ui_inputs || [])].sort((a, b) => a.order - b.order);
   }, [activeWorkflow]);
 
   const runningTask = useMemo(
-    () => queueTasks.find((t) => t.status === 'running') || null,
-    [queueTasks],
+    () => safeQueueTasks.find((t) => t.status === 'running') || null,
+    [safeQueueTasks],
   );
   const queuedTasks = useMemo(
-    () => queueTasks.filter((t) => t.status === 'queued'),
-    [queueTasks],
+    () => safeQueueTasks.filter((t) => t.status === 'queued'),
+    [safeQueueTasks],
   );
   const finishedTasks = useMemo(
     () =>
-      queueTasks.filter(
+      safeQueueTasks.filter(
         (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled',
       ),
-    [queueTasks],
+    [safeQueueTasks],
   );
 
   const selectedOutputTask = useMemo(() => {
     if (selectedOutputTaskId) {
-      const match = queueTasks.find((t) => t.id === selectedOutputTaskId && t.generation);
+      const match = safeQueueTasks.find((t) => t.id === selectedOutputTaskId && t.generation);
       if (match) return match;
     }
-    for (let i = queueTasks.length - 1; i >= 0; i--) {
-      if (queueTasks[i].status === 'completed' && queueTasks[i].generation) {
-        return queueTasks[i];
+    for (let i = safeQueueTasks.length - 1; i >= 0; i--) {
+      if (safeQueueTasks[i].status === 'completed' && safeQueueTasks[i].generation) {
+        return safeQueueTasks[i];
       }
     }
     return null;
-  }, [queueTasks, selectedOutputTaskId]);
+  }, [safeQueueTasks, selectedOutputTaskId]);
 
   const latestGeneration = selectedOutputTask?.generation || null;
 
@@ -343,7 +347,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     setSelectedOutputIndex(0);
   }, [selectedOutputTask?.id]);
 
-  const lastTask = queueTasks[queueTasks.length - 1] || null;
+  const lastTask = safeQueueTasks[safeQueueTasks.length - 1] || null;
   const displayTask = runningTask || (lastTask && lastTask.status === 'failed' ? lastTask : null) || selectedOutputTask;
   const statusMessage = runningTask
     ? runningTask.statusMessage
@@ -450,7 +454,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
         </div>
 
         <div className="p-3 border-t border-zinc-800/80 flex items-center justify-between text-[11px] text-zinc-500">
-          <span className="tabular-nums">{workflows.length} templates</span>
+          <span className="tabular-nums">{safeWorkflows.length} templates</span>
           <button
             type="button"
             onClick={onGoTemplates}
@@ -721,14 +725,14 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
           </div>
 
           <div className="max-h-[210px] overflow-y-auto divide-y divide-zinc-800/60">
-            {queueTasks.length === 0 ? (
+            {safeQueueTasks.length === 0 ? (
               <div className="px-4 py-3 text-xs text-zinc-500">
                 Queue is empty. Click Generate Output to run now or Add to Queue to batch tasks.
               </div>
             ) : (
               (() => {
                 let queuedIndex = 0;
-                return queueTasks.map((task) => {
+                return safeQueueTasks.map((task) => {
                   const currentQueuedPos = task.status === 'queued' ? ++queuedIndex : 0;
                   const isPreviewSelected = selectedOutputTask?.id === task.id;
                   return (

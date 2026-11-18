@@ -7,6 +7,7 @@ import { WorkspaceView } from './components/WorkspaceView.tsx';
 import { TemplatesView } from './components/TemplatesView.tsx';
 import { QueuingView } from './components/QueuingView.tsx';
 import { GalleryView } from './components/GalleryView.tsx';
+import { useGenerationQueue } from './hooks/useGenerationQueue.ts';
 
 function getInitialRoute(): AppRoute {
   const path = window.location.pathname;
@@ -40,6 +41,27 @@ export default function App() {
   const [createTemplateTrigger, setCreateTemplateTrigger] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const handleGenerationComplete = useCallback((gen: GenerationRecord) => {
+    setGenerations((prev) => [gen, ...prev]);
+  }, []);
+
+  const {
+    tasks: queueTasks,
+    isQueueRunning,
+    selectedOutputTaskId,
+    setSelectedOutputTaskId,
+    enqueueTask,
+    startQueue,
+    pauseQueue,
+    runTaskNow,
+    moveTaskUp,
+    cancelTask,
+    retryTask,
+    requeueTask,
+    removeTask,
+    clearFinished,
+  } = useGenerationQueue(handleGenerationComplete);
 
   const navigate = useCallback((nextRoute: AppRoute) => {
     setRoute(nextRoute);
@@ -190,10 +212,21 @@ export default function App() {
               }}
               onClearPrefilled={() => setPrefilledGeneration(null)}
               onOpenConnection={() => setConnectionOpen(true)}
-              onGenerationComplete={(gen) => {
-                setGenerations((prev) => [gen, ...prev]);
-              }}
               onGoTemplates={handleNewTemplate}
+              queueTasks={queueTasks}
+              isQueueRunning={isQueueRunning}
+              selectedOutputTaskId={selectedOutputTaskId}
+              onSelectOutputTask={setSelectedOutputTaskId}
+              onEnqueueTask={enqueueTask}
+              onStartQueue={startQueue}
+              onPauseQueue={pauseQueue}
+              onRunTaskNow={runTaskNow}
+              onMoveTaskUp={moveTaskUp}
+              onCancelTask={cancelTask}
+              onRetryTask={retryTask}
+              onRequeueTask={requeueTask}
+              onRemoveTask={removeTask}
+              onClearFinishedTasks={clearFinished}
             />
           )}
 

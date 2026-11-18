@@ -215,3 +215,25 @@ export interface QueueStatusResponse {
   recent: QueueTaskItem[];
   fetched_at: string;
 }
+
+export interface QueueTask {
+  id: string;
+  workflowId: number;
+  workflowName: string;
+  categoryName: string;
+  outputType: OutputMediaType;
+  uiInputs: UIInputField[];
+  submittedInputs: Record<string, string | number | boolean>;
+  fileValues: Record<string, File>;
+  reusedMedia: Record<string, InputMediaInfo>;
+  summaryText: string;
+  status: QueueTaskState;
+  progressPercent: number;
+  stepProgress: { value: number; max: number } | null;
+  activeNodeLabel: string | null;
+  statusMessage: string;
+  elapsedSeconds: number;
+  error: string | null;
+  generation: GenerationRecord | null;
+  createdAt: number;
+}
