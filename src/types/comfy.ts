@@ -53,6 +53,7 @@ export interface WorkflowTemplate {
   category_id: number;
   category_name: string;
   output_type: OutputMediaType;
+  output_node_ids: string[];
   comfy_api_json: ComfyApiWorkflow;
   ui_inputs: UIInputField[];
   created_at: string;
@@ -74,11 +75,34 @@ export interface InspectedNode {
   inputs: InspectedInput[];
 }
 
+export interface AppInputHint {
+  node_id: string;
+  field_name: string;
+  key: string;
+  title: string;
+  class_type: string;
+  mapped: boolean;
+  reason?: string | null;
+}
+
+export interface InspectedOutput {
+  node_id: string;
+  class_type: string;
+  title: string;
+  media_type: 'image' | 'video';
+  format: string;
+  is_primary_app_output: boolean;
+}
+
 export interface WorkflowInspectResponse {
   nodes: InspectedNode[];
+  outputs?: InspectedOutput[];
+  app_inputs?: AppInputHint[];
   source_format?: 'api' | 'workflow';
   converted_api_json?: ComfyApiWorkflow;
   suggested_field_keys?: string[];
+  suggested_output_type?: OutputMediaType;
+  suggested_output_node_ids?: string[];
   conversion_stats?: {
     total_graph_nodes: number;
     converted_api_nodes: number;

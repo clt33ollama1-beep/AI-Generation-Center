@@ -79,6 +79,10 @@ def get_comfyui_url(session: Session) -> str:
 
 def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
     ui_inputs_raw = json.loads(wf.ui_inputs_json)
+    try:
+        output_node_ids = [str(x) for x in json.loads(wf.output_node_ids_json or "[]")]
+    except Exception:
+        output_node_ids = []
     return WorkflowRead(
         id=wf.id or 0,
         name=wf.name,
@@ -86,6 +90,7 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
         category_id=wf.category_id,
         category_name=category_name,
         output_type=wf.output_type,  # type: ignore[arg-type]
+        output_node_ids=output_node_ids,
         comfy_api_json=json.loads(wf.comfy_api_json),
         ui_inputs=[UIInputField(**item) for item in ui_inputs_raw],
         created_at=wf.created_at,
@@ -208,9 +213,13 @@ def inspect_workflow(payload: WorkflowInspectRequest):
     nodes = inspect_comfy_workflow(normalized["workflow"])
     return WorkflowInspectResponse(
         nodes=nodes,
+        outputs=normalized["outputs"],
+        app_inputs=normalized["app_inputs"],
         source_format=normalized["source_format"],
         converted_api_json=normalized["workflow"],
         suggested_field_keys=normalized["suggested_field_keys"],
+        suggested_output_type=normalized["suggested_output_type"],
+        suggested_output_node_ids=normalized["suggested_output_node_ids"],
         conversion_stats=normalized["conversion_stats"],
     )
 
@@ -236,13 +245,19 @@ def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_sess
     cat = session.get(Category, payload.category_id)
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
-    normalized_wf = normalize_comfy_workflow_payload(payload.comfy_api_json)["workflow"]
+    normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+    output_node_ids = (
+        [str(x) for x in payload.output_node_ids]
+        if payload.output_node_ids is not None
+        else normalized["suggested_output_node_ids"]
+    )
     wf = WorkflowTemplate(
         name=payload.name.strip(),
         description=payload.description.strip(),
         category_id=payload.category_id,
-        output_type=payload.output_type,
-        comfy_api_json=json.dumps(normalized_wf),
+        output_type=payload.output_type or normalized["suggested_output_type"],
+        output_node_ids_json=json.dumps(output_node_ids),
+        comfy_api_json=json.dumps(normalized["workflow"]),
         ui_inputs_json=json.dumps([item.model_dump() for item in payload.ui_inputs]),
     )
     session.add(wf)
@@ -268,9 +283,21 @@ def update_workflow(
         wf.category_id = payload.category_id
     if payload.output_type is not None:
         wf.output_type = payload.output_type
-    if payload.comfy_api_json is not None:
-        normalized_wf = normalize_comfy_workflow_payload(payload.comfy_api_json)["workflow"]
-        wf.comfy_api_json = json.dumps(normalized_wf)
+    normalized = (
+        normalize_comfy_workflow_payload(payload.comfy_api_json)
+        if payload.comfy_api_json is not None
+        else None
+    )
+    if normalized is not None:
+        wf.comfy_api_json = json.dumps(normalized["workflow"])
+    if payload.output_node_ids is not None:
+        wf.output_node_ids_json = json.dumps([str(x) for x in payload.output_node_ids])
+    elif (
+        normalized is not None
+        and normalized["suggested_output_node_ids"]
+        and wf.output_node_ids_json == "[]"
+    ):
+        wf.output_node_ids_json = json.dumps(normalized["suggested_output_node_ids"])
     if payload.ui_inputs is not None:
         wf.ui_inputs_json = json.dumps([item.model_dump() for item in payload.ui_inputs])
     wf.updated_at = utcnow_iso()
@@ -455,6 +482,11 @@ async def generate_output(
         else:
             target_node["inputs"][field.field_name] = "" if raw_val is None else str(raw_val)
 
+    try:
+        wf_output_node_ids = [str(x) for x in json.loads(wf.output_node_ids_json or "[]")]
+    except Exception:
+        wf_output_node_ids = []
+
     # 3. Connect WebSocket & queue prompt on ComfyUI
     try:
         prompt_id = await queue_and_track_generation(
@@ -466,6 +498,7 @@ async def generate_output(
             workflow_payload=workflow_copy,
             submitted_inputs=submitted_inputs,
             client_id=client_id,
+            output_node_ids=wf_output_node_ids,
         )
     except Exception as exc:
         await sse_hub.emit(

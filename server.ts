@@ -79,6 +79,11 @@ db.exec(`
   );
 `);
 
+const workflowCols = db.prepare('PRAGMA table_info(workflows)').all() as Array<{ name: string }>;
+if (!workflowCols.some((c) => c.name === 'output_node_ids_json')) {
+  db.exec("ALTER TABLE workflows ADD COLUMN output_node_ids_json TEXT NOT NULL DEFAULT '[]';");
+}
+
 function slugify(value: string): string {
   return value
     .toLowerCase()
@@ -249,6 +254,15 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
 }
 
 function mapWorkflowRow(row: Record<string, unknown>) {
+  let outputNodeIds: string[] = [];
+  try {
+    const parsed = JSON.parse(String(row.output_node_ids_json || '[]'));
+    if (Array.isArray(parsed)) {
+      outputNodeIds = parsed.map((id) => String(id));
+    }
+  } catch {
+    outputNodeIds = [];
+  }
   return {
     id: Number(row.id),
     name: String(row.name),
@@ -256,6 +270,7 @@ function mapWorkflowRow(row: Record<string, unknown>) {
     category_id: Number(row.category_id),
     category_name: String(row.category_name || ''),
     output_type: String(row.output_type || 'auto'),
+    output_node_ids: outputNodeIds,
     comfy_api_json: JSON.parse(String(row.comfy_api_json)) as ComfyApiWorkflow,
     ui_inputs: JSON.parse(String(row.ui_inputs_json)) as UIInputField[],
     created_at: String(row.created_at),
@@ -348,6 +363,7 @@ async function uploadMediaToComfyUI(
 async function downloadComfyOutputs(
   comfyUrl: string,
   promptId: string,
+  preferredOutputNodeIds: string[] = [],
 ): Promise<OutputFileInfo[]> {
   const historyRes = await fetch(`${comfyUrl}/history/${encodeURIComponent(promptId)}`);
   if (!historyRes.ok) {
@@ -373,9 +389,22 @@ async function downloadComfyOutputs(
     return [];
   }
 
+  const preferredSet = new Set(preferredOutputNodeIds.map((id) => String(id)));
+  const allEntries = Object.entries(entry.outputs);
+  const matchingPreferred =
+    preferredSet.size > 0
+      ? allEntries.filter(([nodeId, out]) => {
+          if (!preferredSet.has(String(nodeId))) return false;
+          return (
+            (out.videos?.length || 0) + (out.gifs?.length || 0) + (out.images?.length || 0) > 0
+          );
+        })
+      : [];
+  const entriesToDownload = matchingPreferred.length > 0 ? matchingPreferred : allEntries;
+
   const savedOutputs: OutputFileInfo[] = [];
 
-  for (const [nodeId, nodeOutput] of Object.entries(entry.outputs)) {
+  for (const [nodeId, nodeOutput] of entriesToDownload) {
     const candidates = [
       ...(nodeOutput.videos || []),
       ...(nodeOutput.gifs || []),
@@ -384,7 +413,6 @@ async function downloadComfyOutputs(
 
     for (const item of candidates) {
       if (!item.filename) continue;
-      // Skip temporary preview items if real output exists, unless type is output/temp
       const params = new URLSearchParams({
         filename: item.filename,
         subfolder: item.subfolder || '',
@@ -544,9 +572,13 @@ app.post('/api/workflows/inspect', (req: Request, res: Response) => {
   const nodes = inspectComfyWorkflow(normalized.workflow);
   res.json({
     nodes,
+    outputs: normalized.outputs,
+    app_inputs: normalized.app_inputs,
     source_format: normalized.source_format,
     converted_api_json: normalized.workflow,
     suggested_field_keys: normalized.suggested_field_keys,
+    suggested_output_type: normalized.suggested_output_type,
+    suggested_output_node_ids: normalized.suggested_output_node_ids,
     conversion_stats: normalized.conversion_stats ?? null,
   });
 });
@@ -585,7 +617,6 @@ app.post('/api/workflows', (req: Request, res: Response) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   const categoryId = Number(req.body?.category_id);
-  const outputType = String(req.body?.output_type || 'auto');
   const comfyApiJson = req.body?.comfy_api_json;
   const uiInputs = Array.isArray(req.body?.ui_inputs) ? req.body.ui_inputs : [];
 
@@ -594,19 +625,24 @@ app.post('/api/workflows', (req: Request, res: Response) => {
     return;
   }
 
-  const normalizedWorkflow = normalizeComfyWorkflowPayload(comfyApiJson).workflow;
+  const normalized = normalizeComfyWorkflowPayload(comfyApiJson);
+  const outputType = String(req.body?.output_type || normalized.suggested_output_type || 'auto');
+  const outputNodeIds = Array.isArray(req.body?.output_node_ids)
+    ? req.body.output_node_ids.map((id: unknown) => String(id))
+    : normalized.suggested_output_node_ids;
 
   const result = db
     .prepare(`
-      INSERT INTO workflows (name, description, category_id, output_type, comfy_api_json, ui_inputs_json)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO workflows (name, description, category_id, output_type, output_node_ids_json, comfy_api_json, ui_inputs_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       name,
       description,
       categoryId,
       outputType,
-      JSON.stringify(normalizedWorkflow),
+      JSON.stringify(outputNodeIds),
+      JSON.stringify(normalized.workflow),
       JSON.stringify(uiInputs),
     );
 
@@ -633,18 +669,26 @@ app.put('/api/workflows/:id', (req: Request, res: Response) => {
   const description = String(req.body?.description ?? existing.description).trim();
   const categoryId = Number(req.body?.category_id ?? existing.category_id);
   const outputType = String(req.body?.output_type ?? existing.output_type);
-  const comfyApiJson = req.body?.comfy_api_json
-    ? JSON.stringify(normalizeComfyWorkflowPayload(req.body.comfy_api_json).workflow)
+  const normalized = req.body?.comfy_api_json
+    ? normalizeComfyWorkflowPayload(req.body.comfy_api_json)
+    : null;
+  const comfyApiJson = normalized
+    ? JSON.stringify(normalized.workflow)
     : String(existing.comfy_api_json);
+  const outputNodeIdsJson = Array.isArray(req.body?.output_node_ids)
+    ? JSON.stringify(req.body.output_node_ids.map((nid: unknown) => String(nid)))
+    : normalized && normalized.suggested_output_node_ids.length > 0 && String(existing.output_node_ids_json || '[]') === '[]'
+      ? JSON.stringify(normalized.suggested_output_node_ids)
+      : String(existing.output_node_ids_json || '[]');
   const uiInputsJson = req.body?.ui_inputs
     ? JSON.stringify(req.body.ui_inputs)
     : String(existing.ui_inputs_json);
 
   db.prepare(`
     UPDATE workflows
-    SET name = ?, description = ?, category_id = ?, output_type = ?, comfy_api_json = ?, ui_inputs_json = ?, updated_at = datetime('now')
+    SET name = ?, description = ?, category_id = ?, output_type = ?, output_node_ids_json = ?, comfy_api_json = ?, ui_inputs_json = ?, updated_at = datetime('now')
     WHERE id = ?
-  `).run(name, description, categoryId, outputType, comfyApiJson, uiInputsJson, id);
+  `).run(name, description, categoryId, outputType, outputNodeIdsJson, comfyApiJson, uiInputsJson, id);
 
   const updated = db
     .prepare(`
@@ -918,7 +962,11 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
     }
 
     try {
-      const outputs = await downloadComfyOutputs(comfyUrl, promptId);
+      const outputs = await downloadComfyOutputs(
+        comfyUrl,
+        promptId,
+        workflowTemplate.output_node_ids,
+      );
       const durationMs = Date.now() - startedAt;
       const hasVideo = outputs.some((o) => o.media_type === 'video');
       const primaryMediaType: 'image' | 'video' =

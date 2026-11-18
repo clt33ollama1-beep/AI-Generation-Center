@@ -82,11 +82,34 @@ class ConversionStats(BaseModel):
     skipped_nodes: int
 
 
+class AppInputHint(BaseModel):
+    node_id: str
+    field_name: str
+    key: str
+    title: str
+    class_type: str
+    mapped: bool
+    reason: Optional[str] = None
+
+
+class InspectedOutput(BaseModel):
+    node_id: str
+    class_type: str
+    title: str
+    media_type: Literal["image", "video"]
+    format: str
+    is_primary_app_output: bool = False
+
+
 class WorkflowInspectResponse(BaseModel):
     nodes: list[InspectedNode]
+    outputs: list[InspectedOutput] = Field(default_factory=list)
+    app_inputs: list[AppInputHint] = Field(default_factory=list)
     source_format: Literal["api", "workflow"] = "api"
     converted_api_json: dict[str, Any] = Field(default_factory=dict)
     suggested_field_keys: list[str] = Field(default_factory=list)
+    suggested_output_type: OutputMediaType = "auto"
+    suggested_output_node_ids: list[str] = Field(default_factory=list)
     conversion_stats: Optional[ConversionStats] = None
 
 
@@ -95,6 +118,7 @@ class WorkflowCreate(BaseModel):
     description: str = ""
     category_id: int
     output_type: OutputMediaType = "auto"
+    output_node_ids: Optional[list[str]] = None
     comfy_api_json: dict[str, Any]
     ui_inputs: list[UIInputField] = Field(default_factory=list)
 
@@ -104,6 +128,7 @@ class WorkflowUpdate(BaseModel):
     description: Optional[str] = None
     category_id: Optional[int] = None
     output_type: Optional[OutputMediaType] = None
+    output_node_ids: Optional[list[str]] = None
     comfy_api_json: Optional[dict[str, Any]] = None
     ui_inputs: Optional[list[UIInputField]] = None
 
@@ -115,6 +140,7 @@ class WorkflowRead(BaseModel):
     category_id: int
     category_name: str
     output_type: OutputMediaType
+    output_node_ids: list[str] = Field(default_factory=list)
     comfy_api_json: dict[str, Any]
     ui_inputs: list[UIInputField]
     created_at: str

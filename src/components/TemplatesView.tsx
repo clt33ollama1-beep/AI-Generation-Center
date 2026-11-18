@@ -11,12 +11,15 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api.ts';
 import type {
+  AppInputHint,
   Category,
   ComfyApiWorkflow,
   InspectedNode,
+  InspectedOutput,
   OutputMediaType,
   UIInputField,
   WidgetType,
+  WorkflowInspectResponse,
   WorkflowTemplate,
 } from '../types/comfy.ts';
 
@@ -51,9 +54,13 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   const [description, setDescription] = useState('');
   const [categoryId, setCategoryId] = useState<number>(categories[0]?.id || 0);
   const [outputType, setOutputType] = useState<OutputMediaType>('auto');
+  const [outputNodeIds, setOutputNodeIds] = useState<string[]>([]);
   const [rawJsonText, setRawJsonText] = useState('');
   const [parsedWorkflow, setParsedWorkflow] = useState<ComfyApiWorkflow | null>(null);
   const [inspectedNodes, setInspectedNodes] = useState<InspectedNode[]>([]);
+  const [inspectedOutputs, setInspectedOutputs] = useState<InspectedOutput[]>([]);
+  const [appInputs, setAppInputs] = useState<AppInputHint[]>([]);
+  const [lastInspectRes, setLastInspectRes] = useState<WorkflowInspectResponse | null>(null);
   const [mappedFields, setMappedFields] = useState<Record<string, UIInputField>>({});
 
   const [newCategoryName, setNewCategoryName] = useState('');
@@ -90,15 +97,50 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     };
   };
 
+  const applyAppSchemaDefaults = (res: WorkflowInspectResponse): number => {
+    const suggestedKeys = res.suggested_field_keys || [];
+    let autoMappedCount = 0;
+    if (suggestedKeys.length > 0) {
+      const autoMapped: Record<string, UIInputField> = {};
+      let order = 1;
+      for (const key of suggestedKeys) {
+        const colonIdx = key.indexOf(':');
+        if (colonIdx === -1) continue;
+        const targetNodeId = key.slice(0, colonIdx);
+        const targetFieldName = key.slice(colonIdx + 1);
+        const foundNode = res.nodes.find((n) => n.node_id === targetNodeId);
+        const foundInput = foundNode?.inputs.find((i) => i.field_name === targetFieldName);
+        if (foundNode && foundInput) {
+          autoMapped[key] = buildDefaultMappedField(foundNode, foundInput, order++);
+          autoMappedCount++;
+        }
+      }
+      if (autoMappedCount > 0) {
+        setMappedFields(autoMapped);
+      }
+    }
+    if (res.suggested_output_type && res.suggested_output_type !== 'auto') {
+      setOutputType(res.suggested_output_type);
+    }
+    if (res.suggested_output_node_ids) {
+      setOutputNodeIds(res.suggested_output_node_ids);
+    }
+    return autoMappedCount;
+  };
+
   const startNewTemplate = () => {
     setEditingId(null);
     setName('');
     setDescription('');
     setCategoryId(categories[0]?.id || 0);
     setOutputType('auto');
+    setOutputNodeIds([]);
     setRawJsonText('');
     setParsedWorkflow(null);
     setInspectedNodes([]);
+    setInspectedOutputs([]);
+    setAppInputs([]);
+    setLastInspectRes(null);
     setMappedFields({});
     setError(null);
     setNotice(null);
@@ -122,8 +164,11 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     setDescription(wf.description);
     setCategoryId(wf.category_id);
     setOutputType(wf.output_type);
+    setOutputNodeIds(wf.output_node_ids || []);
     setParsedWorkflow(wf.comfy_api_json);
     setRawJsonText(JSON.stringify(wf.comfy_api_json, null, 2));
+    setAppInputs([]);
+    setLastInspectRes(null);
     setError(null);
     setNotice(null);
 
@@ -137,6 +182,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       setInspecting(true);
       const res = await api.inspectWorkflow(wf.comfy_api_json);
       setInspectedNodes(res.nodes);
+      setInspectedOutputs(res.outputs || []);
+      setAppInputs(res.app_inputs || []);
+      setLastInspectRes(res);
+      if ((!wf.output_node_ids || wf.output_node_ids.length === 0) && res.suggested_output_node_ids?.length) {
+        setOutputNodeIds(res.suggested_output_node_ids);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to inspect workflow');
     } finally {
@@ -164,26 +215,17 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       const executableWorkflow = (res.converted_api_json || parsed) as ComfyApiWorkflow;
       setParsedWorkflow(executableWorkflow);
       setInspectedNodes(res.nodes);
+      setInspectedOutputs(res.outputs || []);
+      setAppInputs(res.app_inputs || []);
+      setLastInspectRes(res);
 
-      const suggestedKeys = res.suggested_field_keys || [];
       let autoMappedCount = 0;
-      if ((resetMapping || Object.keys(mappedFields).length === 0) && suggestedKeys.length > 0) {
-        const autoMapped: Record<string, UIInputField> = {};
-        let order = 1;
-        for (const key of suggestedKeys) {
-          const colonIdx = key.indexOf(':');
-          if (colonIdx === -1) continue;
-          const targetNodeId = key.slice(0, colonIdx);
-          const targetFieldName = key.slice(colonIdx + 1);
-          const foundNode = res.nodes.find((n) => n.node_id === targetNodeId);
-          const foundInput = foundNode?.inputs.find((i) => i.field_name === targetFieldName);
-          if (foundNode && foundInput) {
-            autoMapped[key] = buildDefaultMappedField(foundNode, foundInput, order++);
-            autoMappedCount++;
-          }
-        }
-        if (autoMappedCount > 0) {
-          setMappedFields(autoMapped);
+      if (resetMapping || Object.keys(mappedFields).length === 0) {
+        autoMappedCount = applyAppSchemaDefaults(res);
+      } else if (outputNodeIds.length === 0 && res.suggested_output_node_ids?.length) {
+        setOutputNodeIds(res.suggested_output_node_ids);
+        if (outputType === 'auto' && res.suggested_output_type && res.suggested_output_type !== 'auto') {
+          setOutputType(res.suggested_output_type);
         }
       }
 
@@ -191,12 +233,14 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
         setError('No editable primitive inputs found in this ComfyUI JSON.');
       } else if (res.source_format === 'workflow' && res.conversion_stats) {
         const stats = res.conversion_stats;
-        const autoHint =
-          autoMappedCount > 0
-            ? ` Pre-selected ${autoMappedCount} primary workflow app inputs.`
+        const outputSummary =
+          (res.suggested_output_node_ids?.length || 0) > 0
+            ? ` Primary output node: ${res.suggested_output_node_ids!.join(', ')} (${res.suggested_output_type || 'auto'}).`
             : '';
+        const autoHint =
+          autoMappedCount > 0 ? ` Loaded ${autoMappedCount} .app.json input controls.` : '';
         setNotice(
-          `Converted ComfyUI workflow graph to API format (${stats.converted_api_nodes} active nodes, ${stats.skipped_nodes} bypassed/virtual nodes omitted).${autoHint}`,
+          `Converted ComfyUI workflow graph to API format (${stats.converted_api_nodes} active nodes, ${stats.skipped_nodes} bypassed/virtual nodes omitted).${autoHint}${outputSummary}`,
         );
       }
     } catch (err) {
@@ -273,6 +317,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           description: description.trim(),
           category_id: categoryId,
           output_type: outputType,
+          output_node_ids: outputNodeIds,
           comfy_api_json: parsedWorkflow,
           ui_inputs: uiInputs,
         });
@@ -284,6 +329,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           description: description.trim(),
           category_id: categoryId,
           output_type: outputType,
+          output_node_ids: outputNodeIds,
           comfy_api_json: parsedWorkflow,
           ui_inputs: uiInputs,
         });
@@ -296,6 +342,15 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     } finally {
       setSaving(false);
     }
+  };
+
+  const toggleOutputNode = (nodeId: string, checked: boolean) => {
+    setOutputNodeIds((prev) => {
+      if (checked) {
+        return prev.includes(nodeId) ? prev : [...prev, nodeId];
+      }
+      return prev.filter((id) => id !== nodeId);
+    });
   };
 
   const handleDeleteTemplate = async (id: number, wfName: string) => {
@@ -585,6 +640,120 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
               className="w-full px-3 py-2.5 text-xs font-mono bg-[#0B0D11] border border-zinc-800 rounded-md text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
             />
           </div>
+
+          {/* Loaded App Input & Output Schema */}
+          {(appInputs.length > 0 || inspectedOutputs.length > 0) && (
+            <div className="rounded-lg border border-zinc-800 bg-[#12151B] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-zinc-800/80">
+                <div>
+                  <h3 className="text-sm font-semibold text-zinc-100">
+                    Loaded Workflow Inputs & Outputs
+                  </h3>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    Detected output nodes and .app.json linearData input/output bindings for this template.
+                  </p>
+                </div>
+                {lastInspectRes && (appInputs.length > 0 || (lastInspectRes.suggested_output_node_ids?.length || 0) > 0) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const count = applyAppSchemaDefaults(lastInspectRes);
+                      setNotice(
+                        `Loaded ${count} .app.json input controls and ${lastInspectRes.suggested_output_node_ids?.length || 0} output node(s).`,
+                      );
+                    }}
+                    className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-100 rounded-md transition-colors cursor-pointer"
+                  >
+                    Apply .app.json Defaults
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {appInputs.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-zinc-300">
+                      Declared App Inputs ({appInputs.length})
+                    </div>
+                    <div className="divide-y divide-zinc-800/70 rounded-md border border-zinc-800 bg-[#0B0D11]">
+                      {appInputs.map((item) => (
+                        <div
+                          key={item.key}
+                          className="px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-zinc-200 font-medium truncate">
+                              {item.title} · <span className="font-mono">{item.field_name}</span>
+                            </div>
+                            <div className="text-[11px] font-mono text-zinc-500 truncate">
+                              Node {item.node_id} · {item.class_type}
+                              {!item.mapped && item.reason ? ` · ${item.reason}` : ''}
+                            </div>
+                          </div>
+                          <span
+                            className={`text-[11px] font-mono shrink-0 ${
+                              item.mapped ? 'text-emerald-400' : 'text-zinc-500'
+                            }`}
+                          >
+                            {item.mapped ? 'Mapped' : 'Skipped'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {inspectedOutputs.length > 0 && (
+                  <div className={appInputs.length > 0 ? 'space-y-2' : 'lg:col-span-2 space-y-2'}>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium text-zinc-300">
+                        Captured Output Nodes ({outputNodeIds.length} selected)
+                      </span>
+                      <span className="text-[11px] text-zinc-500">
+                        Prioritized during generation
+                      </span>
+                    </div>
+                    <div className="divide-y divide-zinc-800/70 rounded-md border border-zinc-800 bg-[#0B0D11]">
+                      {inspectedOutputs.map((out) => {
+                        const checked = outputNodeIds.includes(out.node_id);
+                        return (
+                          <label
+                            key={out.node_id}
+                            className="px-3 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer hover:bg-zinc-900/50"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => toggleOutputNode(out.node_id, e.target.checked)}
+                                className="w-3.5 h-3.5 rounded border-zinc-700 bg-[#0B0D11] text-blue-600"
+                              />
+                              <div className="min-w-0">
+                                <div className="text-zinc-200 font-medium truncate">
+                                  {out.title}
+                                  {out.is_primary_app_output && (
+                                    <span className="ml-2 text-[11px] font-mono text-blue-400">
+                                      App Output
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] font-mono text-zinc-500 truncate">
+                                  Node {out.node_id} · {out.class_type}
+                                </div>
+                              </div>
+                            </div>
+                            <span className="text-[11px] font-mono text-zinc-400 uppercase shrink-0">
+                              {out.media_type} · {out.format}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Dynamic Node Field Mapper */}
           {inspectedNodes.length > 0 && (

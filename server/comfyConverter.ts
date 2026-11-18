@@ -1,4 +1,10 @@
-import type { ComfyApiWorkflow, ComfyNode } from '../src/types/comfy.ts';
+import type {
+  AppInputHint,
+  ComfyApiWorkflow,
+  ComfyNode,
+  InspectedOutput,
+  OutputMediaType,
+} from '../src/types/comfy.ts';
 
 interface GraphInputSlot {
   name: string;
@@ -47,7 +53,11 @@ interface ComfyGraphWorkflow {
 export interface NormalizedWorkflowResult {
   workflow: ComfyApiWorkflow;
   source_format: 'api' | 'workflow';
+  app_inputs: AppInputHint[];
+  outputs: InspectedOutput[];
   suggested_field_keys: string[];
+  suggested_output_type: OutputMediaType;
+  suggested_output_node_ids: string[];
   conversion_stats?: {
     total_graph_nodes: number;
     converted_api_nodes: number;
@@ -79,6 +89,31 @@ const FRONTEND_WIDGET_KEYS = new Set([
 
 const SEED_CONTROL_VALUES = new Set(['fixed', 'increment', 'decrement', 'randomize']);
 
+const VIDEO_OUTPUT_NODE_TYPES = new Set([
+  'VHS_VideoCombine',
+  'SaveVideo',
+  'SaveWEBM',
+  'SaveAnimatedWEBP',
+  'SaveAnimatedPNG',
+]);
+
+const IMAGE_OUTPUT_NODE_TYPES = new Set([
+  'SaveImage',
+  'SaveImageAdvanced',
+  'PreviewImage',
+  'Image Comparer (rgthree)',
+]);
+
+const PRIMARY_SINK_NODE_TYPES = new Set([
+  'SaveImage',
+  'SaveImageAdvanced',
+  'VHS_VideoCombine',
+  'SaveVideo',
+  'SaveWEBM',
+  'SaveAnimatedWEBP',
+  'SaveAnimatedPNG',
+]);
+
 export function isComfyGraphWorkflow(payload: unknown): payload is ComfyGraphWorkflow {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return false;
@@ -101,9 +136,115 @@ type ResolvedOrigin =
   | { kind: 'link'; nodeId: string; slot: number }
   | { kind: 'value'; value: unknown };
 
+function classifyOutputNode(
+  nodeId: string,
+  node: ComfyNode,
+  isPrimaryAppOutput: boolean,
+): InspectedOutput {
+  const inputs = node.inputs || {};
+  const rawFormat = typeof inputs.format === 'string' ? inputs.format : '';
+  const fmtLower = rawFormat.toLowerCase();
+
+  let mediaType: 'image' | 'video' = 'image';
+  let format = rawFormat || 'png';
+
+  if (
+    VIDEO_OUTPUT_NODE_TYPES.has(node.class_type) ||
+    fmtLower.startsWith('video/') ||
+    fmtLower === 'mp4' ||
+    fmtLower === 'webm' ||
+    fmtLower === 'gif' ||
+    fmtLower === 'webp'
+  ) {
+    mediaType = 'video';
+    if (!rawFormat) {
+      if (node.class_type === 'SaveWEBM') format = 'webm';
+      else if (node.class_type === 'SaveAnimatedWEBP') format = 'webp';
+      else if (node.class_type === 'SaveAnimatedPNG') format = 'apng';
+      else format = 'mp4';
+    }
+  }
+
+  return {
+    node_id: nodeId,
+    class_type: node.class_type,
+    title: node._meta?.title || node.class_type,
+    media_type: mediaType,
+    format,
+    is_primary_app_output: isPrimaryAppOutput,
+  };
+}
+
+export function extractWorkflowOutputs(
+  apiWorkflow: ComfyApiWorkflow,
+  linearOutputNodeIds: string[] = [],
+): {
+  outputs: InspectedOutput[];
+  suggested_output_type: OutputMediaType;
+  suggested_output_node_ids: string[];
+} {
+  const primarySet = new Set(linearOutputNodeIds.map((id) => String(id)));
+  const outputs: InspectedOutput[] = [];
+  const seen = new Set<string>();
+
+  for (const id of linearOutputNodeIds) {
+    const nodeId = String(id);
+    const node = apiWorkflow[nodeId];
+    if (node && typeof node === 'object' && node.class_type) {
+      outputs.push(classifyOutputNode(nodeId, node, true));
+      seen.add(nodeId);
+    }
+  }
+
+  const sortedIds = Object.keys(apiWorkflow).sort((a, b) => {
+    const aNum = Number(a);
+    const bNum = Number(b);
+    if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+    return a.localeCompare(b);
+  });
+
+  for (const nodeId of sortedIds) {
+    if (seen.has(nodeId)) continue;
+    const node = apiWorkflow[nodeId];
+    if (!node || typeof node !== 'object' || !node.class_type) continue;
+    if (VIDEO_OUTPUT_NODE_TYPES.has(node.class_type) || IMAGE_OUTPUT_NODE_TYPES.has(node.class_type)) {
+      outputs.push(classifyOutputNode(nodeId, node, primarySet.has(nodeId)));
+      seen.add(nodeId);
+    }
+  }
+
+  const primaryOutputs = outputs.filter((o) => o.is_primary_app_output);
+  const effectiveOutputs =
+    primaryOutputs.length > 0
+      ? primaryOutputs
+      : outputs.filter((o) => PRIMARY_SINK_NODE_TYPES.has(o.class_type));
+
+  let suggestedOutputType: OutputMediaType = 'auto';
+  if (effectiveOutputs.some((o) => o.media_type === 'video')) {
+    suggestedOutputType = 'video';
+  } else if (effectiveOutputs.some((o) => o.media_type === 'image')) {
+    suggestedOutputType = 'image';
+  }
+
+  const suggestedOutputNodeIds =
+    primaryOutputs.length > 0
+      ? primaryOutputs.map((o) => o.node_id)
+      : outputs.filter((o) => PRIMARY_SINK_NODE_TYPES.has(o.class_type)).map((o) => o.node_id);
+
+  return {
+    outputs,
+    suggested_output_type: suggestedOutputType,
+    suggested_output_node_ids: suggestedOutputNodeIds,
+  };
+}
+
 export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
   workflow: ComfyApiWorkflow;
+  app_inputs: AppInputHint[];
+  outputs: InspectedOutput[];
   suggested_field_keys: string[];
+  suggested_output_type: OutputMediaType;
+  suggested_output_node_ids: string[];
   stats: { total_graph_nodes: number; converted_api_nodes: number; skipped_nodes: number };
 } {
   const nodesById = new Map<string, GraphNode>();
@@ -124,7 +265,9 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
   for (const node of graph.nodes) {
     if (node?.type === 'SetNode' && (node.mode ?? 0) !== 2) {
       const constName = getSetGetConstantName(node);
-      const connectedInput = (node.inputs || []).find((inp) => inp.link !== null && inp.link !== undefined);
+      const connectedInput = (node.inputs || []).find(
+        (inp) => inp.link !== null && inp.link !== undefined,
+      );
       if (constName && connectedInput?.link !== null && connectedInput?.link !== undefined) {
         setNodeLinks.set(constName, Number(connectedInput.link));
       }
@@ -152,19 +295,10 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
 
     const mode = originNode.mode ?? 0;
     if (mode === 2) {
-      // Muted / Never
       return null;
     }
 
-    if (originNode.type === 'Reroute') {
-      const firstInput = (originNode.inputs || []).find(
-        (inp) => inp.link !== null && inp.link !== undefined,
-      );
-      if (!firstInput || firstInput.link === null || firstInput.link === undefined) return null;
-      return resolveLinkOrigin(Number(firstInput.link), nextVisited);
-    }
-
-    if (originNode.type === 'SetNode') {
+    if (originNode.type === 'Reroute' || originNode.type === 'SetNode') {
       const firstInput = (originNode.inputs || []).find(
         (inp) => inp.link !== null && inp.link !== undefined,
       );
@@ -191,7 +325,6 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
     }
 
     if (mode === 4) {
-      // Bypassed: trace through matching-type connected input if available
       const expectedType = originNode.outputs?.[originSlot]?.type || linkType;
       const connectedInputs = (originNode.inputs || []).filter(
         (inp) => inp.link !== null && inp.link !== undefined,
@@ -244,7 +377,11 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
       }
     }
 
-    if (node.widgets_values_named && typeof node.widgets_values_named === 'object' && !Array.isArray(node.widgets_values_named)) {
+    if (
+      node.widgets_values_named &&
+      typeof node.widgets_values_named === 'object' &&
+      !Array.isArray(node.widgets_values_named)
+    ) {
       for (const [key, val] of Object.entries(node.widgets_values_named)) {
         if (FRONTEND_WIDGET_KEYS.has(key) || key.startsWith('divider')) {
           continue;
@@ -272,7 +409,6 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
       }
     }
 
-    // Prune active nodes whose upstream inputs were all muted/bypassed away
     if (linkedInputCount > 0 && resolvedLinkCount === 0) {
       skippedNodes++;
       continue;
@@ -288,32 +424,76 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
     apiWorkflow[nodeId] = apiNode;
   }
 
-  // Extract optional ComfyUI linearData suggested inputs
+  // Extract ComfyUI .app.json linearData.inputs metadata
+  const appInputs: AppInputHint[] = [];
   const suggestedFieldKeys: string[] = [];
   const linearInputs = graph.extra?.linearData?.inputs;
   if (Array.isArray(linearInputs)) {
     for (const item of linearInputs) {
       if (!Array.isArray(item) || item.length < 2) continue;
       const spec = String(item[0] || '');
-      const fieldName = String(item[1] || '');
+      let fieldName = String(item[1] || '');
+      try {
+        fieldName = decodeURIComponent(fieldName);
+      } catch {
+        // keep original if not valid URI encoding
+      }
       const parts = spec.split(':');
       const nodeId = parts.length >= 3 ? parts[parts.length - 2] : parts[0];
+      const key = `${nodeId}:${fieldName}`;
       const apiNode = apiWorkflow[nodeId];
+      const rawNode = nodesById.get(nodeId);
+
       if (apiNode && fieldName && fieldName in apiNode.inputs) {
         const val = apiNode.inputs[fieldName];
         if (!Array.isArray(val) && (val === null || typeof val !== 'object')) {
-          const key = `${nodeId}:${fieldName}`;
           if (!suggestedFieldKeys.includes(key)) {
             suggestedFieldKeys.push(key);
           }
+          appInputs.push({
+            node_id: nodeId,
+            field_name: fieldName,
+            key,
+            title: apiNode._meta?.title || apiNode.class_type,
+            class_type: apiNode.class_type,
+            mapped: true,
+          });
+          continue;
         }
+      }
+
+      if (rawNode) {
+        const reason = VIRTUAL_NODE_TYPES.has(rawNode.type)
+          ? `Canvas-only control (${rawNode.type})`
+          : (rawNode.mode ?? 0) !== 0
+            ? 'Node is bypassed or muted in workflow'
+            : 'Input is linked or non-primitive';
+        appInputs.push({
+          node_id: nodeId,
+          field_name: fieldName,
+          key,
+          title: rawNode.title || rawNode.type,
+          class_type: rawNode.type,
+          mapped: false,
+          reason,
+        });
       }
     }
   }
 
+  // Extract ComfyUI .app.json linearData.outputs & detected output nodes
+  const rawLinearOutputs = Array.isArray(graph.extra?.linearData?.outputs)
+    ? graph.extra!.linearData!.outputs.map((id) => String(id))
+    : [];
+  const outputMeta = extractWorkflowOutputs(apiWorkflow, rawLinearOutputs);
+
   return {
     workflow: apiWorkflow,
+    app_inputs: appInputs,
+    outputs: outputMeta.outputs,
     suggested_field_keys: suggestedFieldKeys,
+    suggested_output_type: outputMeta.suggested_output_type,
+    suggested_output_node_ids: outputMeta.suggested_output_node_ids,
     stats: {
       total_graph_nodes: graph.nodes.length,
       converted_api_nodes: Object.keys(apiWorkflow).length,
@@ -328,16 +508,27 @@ export function normalizeComfyWorkflowPayload(payload: unknown): NormalizedWorkf
     return {
       workflow: converted.workflow,
       source_format: 'workflow',
+      app_inputs: converted.app_inputs,
+      outputs: converted.outputs,
       suggested_field_keys: converted.suggested_field_keys,
+      suggested_output_type: converted.suggested_output_type,
+      suggested_output_node_ids: converted.suggested_output_node_ids,
       conversion_stats: converted.stats,
     };
   }
 
+  const apiWorkflow = (
+    payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
+  ) as ComfyApiWorkflow;
+  const outputMeta = extractWorkflowOutputs(apiWorkflow, []);
+
   return {
-    workflow: (payload && typeof payload === 'object' && !Array.isArray(payload)
-      ? payload
-      : {}) as ComfyApiWorkflow,
+    workflow: apiWorkflow,
     source_format: 'api',
+    app_inputs: [],
+    outputs: outputMeta.outputs,
     suggested_field_keys: [],
+    suggested_output_type: outputMeta.suggested_output_type,
+    suggested_output_node_ids: outputMeta.suggested_output_node_ids,
   };
 }

@@ -63,6 +63,7 @@ export const api = {
     description: string;
     category_id: number;
     output_type: OutputMediaType;
+    output_node_ids?: string[];
     comfy_api_json: ComfyApiWorkflow;
     ui_inputs: UIInputField[];
   }) =>
@@ -79,6 +80,7 @@ export const api = {
       description: string;
       category_id: number;
       output_type: OutputMediaType;
+      output_node_ids?: string[];
       comfy_api_json: ComfyApiWorkflow;
       ui_inputs: UIInputField[];
     },

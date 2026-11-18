@@ -100,7 +100,11 @@ async def upload_media_to_comfyui(
         return f"{subfolder}/{name}" if subfolder else name
 
 
-async def download_comfy_outputs(comfyui_url: str, prompt_id: str) -> list[OutputFileInfo]:
+async def download_comfy_outputs(
+    comfyui_url: str,
+    prompt_id: str,
+    preferred_output_node_ids: list[str] | None = None,
+) -> list[OutputFileInfo]:
     url = comfyui_url.rstrip("/")
     async with httpx.AsyncClient(timeout=120.0) as client:
         hist_resp = await client.get(f"{url}/history/{quote(prompt_id)}")
@@ -110,9 +114,23 @@ async def download_comfy_outputs(comfyui_url: str, prompt_id: str) -> list[Outpu
 
         entry = history_data.get(prompt_id, {})
         outputs_map = entry.get("outputs", {})
+        preferred_set = {str(nid) for nid in (preferred_output_node_ids or [])}
+        all_items = list(outputs_map.items())
+        matching_preferred = (
+            [
+                (nid, out)
+                for nid, out in all_items
+                if str(nid) in preferred_set
+                and isinstance(out, dict)
+                and any(isinstance(out.get(k), list) and out.get(k) for k in ("videos", "gifs", "images"))
+            ]
+            if preferred_set
+            else []
+        )
+        entries_to_download = matching_preferred if matching_preferred else all_items
         saved_outputs: list[OutputFileInfo] = []
 
-        for node_id, node_output in outputs_map.items():
+        for node_id, node_output in entries_to_download:
             if not isinstance(node_output, dict):
                 continue
             candidates: list[dict[str, Any]] = []
@@ -166,6 +184,7 @@ async def queue_and_track_generation(
     workflow_payload: dict[str, Any],
     submitted_inputs: dict[str, Any],
     client_id: str,
+    output_node_ids: list[str] | None = None,
 ) -> str:
     ws_url = to_ws_url(comfyui_url, client_id)
     base_url = comfyui_url.rstrip("/")
@@ -200,6 +219,7 @@ async def queue_and_track_generation(
             workflow_payload=workflow_payload,
             submitted_inputs=submitted_inputs,
             started_at=started_at,
+            output_node_ids=output_node_ids,
         )
     )
     return prompt_id
@@ -217,6 +237,7 @@ async def _watch_ws_until_done(
     workflow_payload: dict[str, Any],
     submitted_inputs: dict[str, Any],
     started_at: float,
+    output_node_ids: list[str] | None = None,
 ) -> None:
     await sse_hub.emit(
         client_id,
@@ -293,7 +314,7 @@ async def _watch_ws_until_done(
                 )
                 return
 
-        outputs = await download_comfy_outputs(comfyui_url, prompt_id)
+        outputs = await download_comfy_outputs(comfyui_url, prompt_id, output_node_ids)
         duration_ms = int((time.monotonic() - started_at) * 1000)
         has_video = any(o.media_type == "video" for o in outputs)
         primary_media_type = "video" if (output_type == "video" or has_video) else "image"

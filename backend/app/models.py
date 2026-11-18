@@ -33,6 +33,7 @@ class WorkflowTemplate(SQLModel, table=True):
     description: str = Field(default="")
     category_id: int = Field(foreign_key="categories.id", ondelete="CASCADE")
     output_type: str = Field(default="auto")
+    output_node_ids_json: str = Field(default="[]")
     comfy_api_json: str
     ui_inputs_json: str
     created_at: str = Field(default_factory=utcnow_iso)

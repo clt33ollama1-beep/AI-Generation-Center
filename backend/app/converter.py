@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import unquote
 
 
 VIRTUAL_NODE_TYPES = {
@@ -25,6 +26,31 @@ FRONTEND_WIDGET_KEYS = {
 
 SEED_CONTROL_VALUES = {"fixed", "increment", "decrement", "randomize"}
 
+VIDEO_OUTPUT_NODE_TYPES = {
+    "VHS_VideoCombine",
+    "SaveVideo",
+    "SaveWEBM",
+    "SaveAnimatedWEBP",
+    "SaveAnimatedPNG",
+}
+
+IMAGE_OUTPUT_NODE_TYPES = {
+    "SaveImage",
+    "SaveImageAdvanced",
+    "PreviewImage",
+    "Image Comparer (rgthree)",
+}
+
+PRIMARY_SINK_NODE_TYPES = {
+    "SaveImage",
+    "SaveImageAdvanced",
+    "VHS_VideoCombine",
+    "SaveVideo",
+    "SaveWEBM",
+    "SaveAnimatedWEBP",
+    "SaveAnimatedPNG",
+}
+
 
 def is_comfy_graph_workflow(payload: Any) -> bool:
     return (
@@ -47,6 +73,103 @@ def _get_set_get_constant_name(node: dict[str, Any]) -> str:
     if title.startswith("Get_"):
         return title[4:]
     return title
+
+
+def _classify_output_node(
+    node_id: str, node: dict[str, Any], is_primary_app_output: bool
+) -> dict[str, Any]:
+    class_type = str(node.get("class_type", ""))
+    inputs = node.get("inputs") or {}
+    raw_format = inputs.get("format") if isinstance(inputs.get("format"), str) else ""
+    fmt_lower = raw_format.lower()
+
+    media_type = "image"
+    fmt = raw_format or "png"
+    if (
+        class_type in VIDEO_OUTPUT_NODE_TYPES
+        or fmt_lower.startswith("video/")
+        or fmt_lower in {"mp4", "webm", "gif", "webp"}
+    ):
+        media_type = "video"
+        if not raw_format:
+            if class_type == "SaveWEBM":
+                fmt = "webm"
+            elif class_type == "SaveAnimatedWEBP":
+                fmt = "webp"
+            elif class_type == "SaveAnimatedPNG":
+                fmt = "apng"
+            else:
+                fmt = "mp4"
+
+    meta = node.get("_meta")
+    title = (
+        meta.get("title")
+        if isinstance(meta, dict) and isinstance(meta.get("title"), str)
+        else class_type
+    )
+
+    return {
+        "node_id": node_id,
+        "class_type": class_type,
+        "title": title,
+        "media_type": media_type,
+        "format": fmt,
+        "is_primary_app_output": is_primary_app_output,
+    }
+
+
+def extract_workflow_outputs(
+    api_workflow: dict[str, Any], linear_output_node_ids: list[str] | None = None
+) -> dict[str, Any]:
+    linear_ids = [str(i) for i in (linear_output_node_ids or [])]
+    primary_set = set(linear_ids)
+    outputs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for node_id in linear_ids:
+        node = api_workflow.get(node_id)
+        if isinstance(node, dict) and node.get("class_type"):
+            outputs.append(_classify_output_node(node_id, node, True))
+            seen.add(node_id)
+
+    def sort_key(nid: str) -> tuple[int, str]:
+        return (0, f"{int(nid):010d}") if nid.isdigit() else (1, nid)
+
+    for node_id in sorted(api_workflow.keys(), key=sort_key):
+        if node_id in seen:
+            continue
+        node = api_workflow.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if class_type in VIDEO_OUTPUT_NODE_TYPES or class_type in IMAGE_OUTPUT_NODE_TYPES:
+            outputs.append(_classify_output_node(node_id, node, node_id in primary_set))
+            seen.add(node_id)
+
+    primary_outputs = [o for o in outputs if o["is_primary_app_output"]]
+    effective_outputs = (
+        primary_outputs
+        if primary_outputs
+        else [o for o in outputs if o["class_type"] in PRIMARY_SINK_NODE_TYPES]
+    )
+
+    suggested_output_type = "auto"
+    if any(o["media_type"] == "video" for o in effective_outputs):
+        suggested_output_type = "video"
+    elif any(o["media_type"] == "image" for o in effective_outputs):
+        suggested_output_type = "image"
+
+    suggested_output_node_ids = (
+        [o["node_id"] for o in primary_outputs]
+        if primary_outputs
+        else [o["node_id"] for o in outputs if o["class_type"] in PRIMARY_SINK_NODE_TYPES]
+    )
+
+    return {
+        "outputs": outputs,
+        "suggested_output_type": suggested_output_type,
+        "suggested_output_node_ids": suggested_output_node_ids,
+    }
 
 
 def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
@@ -192,7 +315,9 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
             widget_inputs = [
                 inp
                 for inp in (node.get("inputs") or [])
-                if isinstance(inp, dict) and isinstance(inp.get("widget"), dict) and inp["widget"].get("name")
+                if isinstance(inp, dict)
+                and isinstance(inp.get("widget"), dict)
+                and inp["widget"].get("name")
             ]
             w_idx = 0
             for inp in widget_inputs:
@@ -220,27 +345,75 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
             "_meta": {"title": node.get("title") or node_type},
         }
 
+    app_inputs: list[dict[str, Any]] = []
     suggested_field_keys: list[str] = []
-    linear_inputs = (graph.get("extra") or {}).get("linearData", {}).get("inputs")
+    linear_data = (graph.get("extra") or {}).get("linearData") or {}
+    linear_inputs = linear_data.get("inputs")
     if isinstance(linear_inputs, list):
         for item in linear_inputs:
             if not isinstance(item, list) or len(item) < 2:
                 continue
             spec = str(item[0] or "")
-            field_name = str(item[1] or "")
+            field_name = unquote(str(item[1] or ""))
             parts = spec.split(":")
             node_id = parts[-2] if len(parts) >= 3 else parts[0]
+            key = f"{node_id}:{field_name}"
             api_node = api_workflow.get(node_id)
+            raw_node = nodes_by_id.get(node_id)
+
             if isinstance(api_node, dict) and field_name in api_node.get("inputs", {}):
                 val = api_node["inputs"][field_name]
                 if not isinstance(val, (dict, list)):
-                    key = f"{node_id}:{field_name}"
                     if key not in suggested_field_keys:
                         suggested_field_keys.append(key)
+                    meta = api_node.get("_meta") or {}
+                    app_inputs.append(
+                        {
+                            "node_id": node_id,
+                            "field_name": field_name,
+                            "key": key,
+                            "title": meta.get("title") or api_node["class_type"],
+                            "class_type": api_node["class_type"],
+                            "mapped": True,
+                            "reason": None,
+                        }
+                    )
+                    continue
+
+            if isinstance(raw_node, dict):
+                raw_type = str(raw_node.get("type", ""))
+                if raw_type in VIRTUAL_NODE_TYPES:
+                    reason = f"Canvas-only control ({raw_type})"
+                elif raw_node.get("mode", 0) != 0:
+                    reason = "Node is bypassed or muted in workflow"
+                else:
+                    reason = "Input is linked or non-primitive"
+                app_inputs.append(
+                    {
+                        "node_id": node_id,
+                        "field_name": field_name,
+                        "key": key,
+                        "title": raw_node.get("title") or raw_type,
+                        "class_type": raw_type,
+                        "mapped": False,
+                        "reason": reason,
+                    }
+                )
+
+    raw_linear_outputs = (
+        [str(x) for x in linear_data.get("outputs", [])]
+        if isinstance(linear_data.get("outputs"), list)
+        else []
+    )
+    output_meta = extract_workflow_outputs(api_workflow, raw_linear_outputs)
 
     return {
         "workflow": api_workflow,
+        "app_inputs": app_inputs,
+        "outputs": output_meta["outputs"],
         "suggested_field_keys": suggested_field_keys,
+        "suggested_output_type": output_meta["suggested_output_type"],
+        "suggested_output_node_ids": output_meta["suggested_output_node_ids"],
         "stats": {
             "total_graph_nodes": len(raw_nodes),
             "converted_api_nodes": len(api_workflow),
@@ -255,13 +428,23 @@ def normalize_comfy_workflow_payload(payload: Any) -> dict[str, Any]:
         return {
             "workflow": converted["workflow"],
             "source_format": "workflow",
+            "app_inputs": converted["app_inputs"],
+            "outputs": converted["outputs"],
             "suggested_field_keys": converted["suggested_field_keys"],
+            "suggested_output_type": converted["suggested_output_type"],
+            "suggested_output_node_ids": converted["suggested_output_node_ids"],
             "conversion_stats": converted["stats"],
         }
 
+    api_workflow = payload if isinstance(payload, dict) else {}
+    output_meta = extract_workflow_outputs(api_workflow, [])
     return {
-        "workflow": payload if isinstance(payload, dict) else {},
+        "workflow": api_workflow,
         "source_format": "api",
+        "app_inputs": [],
+        "outputs": output_meta["outputs"],
         "suggested_field_keys": [],
+        "suggested_output_type": output_meta["suggested_output_type"],
+        "suggested_output_node_ids": output_meta["suggested_output_node_ids"],
         "conversion_stats": None,
     }
