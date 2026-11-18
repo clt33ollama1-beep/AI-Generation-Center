@@ -16,9 +16,13 @@ from starlette.datastructures import UploadFile
 
 from pathlib import Path
 from app.comfy_client import (
+    cancel_comfy_queued_task,
     check_comfy_health,
+    clear_comfy_pending_queue,
     detect_media_type,
+    fetch_queue_status,
     guess_mime_type,
+    interrupt_comfy_queue,
     queue_and_track_generation,
     resolve_safe_outputs_path,
     sse_hub,
@@ -42,6 +46,8 @@ from app.schemas import (
     GenerationRead,
     InputMediaInfo,
     OutputFileInfo,
+    QueueCancelRequest,
+    QueueStatusResponse,
     SettingsPayload,
     UIInputField,
     WorkflowCreate,
@@ -548,6 +554,47 @@ async def stream_progress(client_id: str, request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/queue", response_model=QueueStatusResponse)
+async def get_queue_status(session: Session = Depends(get_session)):
+    comfy_url = get_comfyui_url(session)
+    return await fetch_queue_status(comfy_url)
+
+
+@app.post("/api/queue/interrupt")
+async def interrupt_queue(session: Session = Depends(get_session)):
+    comfy_url = get_comfyui_url(session)
+    try:
+        await interrupt_comfy_queue(comfy_url)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/queue/cancel")
+async def cancel_queued_task(
+    payload: QueueCancelRequest, session: Session = Depends(get_session)
+):
+    prompt_id = payload.prompt_id.strip()
+    if not prompt_id:
+        raise HTTPException(status_code=400, detail="prompt_id is required")
+    comfy_url = get_comfyui_url(session)
+    try:
+        await cancel_comfy_queued_task(comfy_url, prompt_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "deleted": prompt_id}
+
+
+@app.post("/api/queue/clear")
+async def clear_pending_queue(session: Session = Depends(get_session)):
+    comfy_url = get_comfyui_url(session)
+    try:
+        await clear_comfy_pending_queue(comfy_url)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @app.post("/api/generate", status_code=202)

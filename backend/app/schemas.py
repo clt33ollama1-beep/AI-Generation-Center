@@ -184,3 +184,43 @@ class GenerationRead(BaseModel):
     duration_ms: int
     error_message: Optional[str] = None
     created_at: str
+
+
+QueueTaskState = Literal["running", "queued", "completed", "failed", "cancelled"]
+
+
+class QueueTaskItem(BaseModel):
+    prompt_id: str
+    client_id: Optional[str] = None
+    queue_number: Optional[int] = None
+    queue_position: Optional[int] = None
+    state: QueueTaskState
+    workflow_id: Optional[int] = None
+    workflow_name: str
+    category_name: str
+    source: Literal["comfycentre", "external"] = "comfycentre"
+    node_count: int = 0
+    current_node_id: Optional[str] = None
+    current_node_title: Optional[str] = None
+    step_value: Optional[int] = None
+    step_max: Optional[int] = None
+    progress_percent: int = 0
+    submitted_inputs: dict[str, Any] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+
+class QueueStatusResponse(BaseModel):
+    comfyui_url: str
+    comfy_connected: bool
+    comfy_error: Optional[str] = None
+    running: list[QueueTaskItem] = Field(default_factory=list)
+    pending: list[QueueTaskItem] = Field(default_factory=list)
+    recent: list[QueueTaskItem] = Field(default_factory=list)
+    fetched_at: str
+
+
+class QueueCancelRequest(BaseModel):
+    prompt_id: str

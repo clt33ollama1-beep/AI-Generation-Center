@@ -1,6 +1,6 @@
 import React from 'react';
 
-export type AppRoute = '/' | '/templates' | '/gallery';
+export type AppRoute = '/' | '/templates' | '/queuing' | '/gallery';
 
 interface TopBarProps {
   activeRoute: AppRoute;
@@ -55,6 +55,16 @@ export const TopBar: React.FC<TopBarProps> = ({
           className={navLinkClass(activeRoute === '/templates')}
         >
           Templates
+        </a>
+        <a
+          href="/queuing"
+          onClick={(e) => {
+            e.preventDefault();
+            onNavigate('/queuing');
+          }}
+          className={navLinkClass(activeRoute === '/queuing')}
+        >
+          Queuing
         </a>
         <a
           href="/gallery"

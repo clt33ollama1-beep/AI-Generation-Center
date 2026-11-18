@@ -5,6 +5,7 @@ import type {
   GenerationRecord,
   OutputMediaType,
   ProgressEventPayload,
+  QueueStatusResponse,
   UIInputField,
   WorkflowInspectResponse,
   WorkflowTemplate,
@@ -124,6 +125,25 @@ export const api = {
     requestJson<{ prompt_id: string; client_id: string; status: string }>('/api/generate', {
       method: 'POST',
       body: formData,
+    }),
+
+  getQueueStatus: () => requestJson<QueueStatusResponse>('/api/queue'),
+
+  interruptQueue: () =>
+    requestJson<{ ok: boolean }>('/api/queue/interrupt', {
+      method: 'POST',
+    }),
+
+  cancelQueuedTask: (promptId: string) =>
+    requestJson<{ ok: boolean; deleted: string }>('/api/queue/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt_id: promptId }),
+    }),
+
+  clearPendingQueue: () =>
+    requestJson<{ ok: boolean }>('/api/queue/clear', {
+      method: 'POST',
     }),
 
   subscribeProgress: (

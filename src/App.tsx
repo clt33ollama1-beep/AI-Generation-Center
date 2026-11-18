@@ -5,11 +5,13 @@ import { TopBar, type AppRoute } from './components/TopBar.tsx';
 import { ConnectionModal } from './components/ConnectionModal.tsx';
 import { WorkspaceView } from './components/WorkspaceView.tsx';
 import { TemplatesView } from './components/TemplatesView.tsx';
+import { QueuingView } from './components/QueuingView.tsx';
 import { GalleryView } from './components/GalleryView.tsx';
 
 function getInitialRoute(): AppRoute {
   const path = window.location.pathname;
   if (path.startsWith('/templates')) return '/templates';
+  if (path.startsWith('/queuing')) return '/queuing';
   if (path.startsWith('/gallery')) return '/gallery';
   return '/';
 }
@@ -205,6 +207,23 @@ export default function App() {
                 setPrefilledGeneration(null);
                 setSelectedWorkflowId(wfId);
                 navigate('/');
+              }}
+            />
+          )}
+
+          {route === '/queuing' && (
+            <QueuingView
+              onOpenConnection={() => setConnectionOpen(true)}
+              onOpenWorkspace={(wfId) => {
+                setPrefilledGeneration(null);
+                if (wfId) {
+                  setSelectedWorkflowId(wfId);
+                }
+                navigate('/');
+              }}
+              onOpenGallery={() => {
+                void refreshAll().catch(() => {});
+                navigate('/gallery');
               }}
             />
           )}

@@ -180,3 +180,38 @@ export interface ComfyHealthResponse {
     }>;
   };
 }
+
+export type QueueTaskState = 'running' | 'queued' | 'completed' | 'failed' | 'cancelled';
+
+export interface QueueTaskItem {
+  prompt_id: string;
+  client_id?: string | null;
+  queue_number?: number | null;
+  queue_position?: number | null;
+  state: QueueTaskState;
+  workflow_id?: number | null;
+  workflow_name: string;
+  category_name: string;
+  source: 'comfycentre' | 'external';
+  node_count: number;
+  current_node_id?: string | null;
+  current_node_title?: string | null;
+  step_value?: number | null;
+  step_max?: number | null;
+  progress_percent: number;
+  submitted_inputs: Record<string, unknown>;
+  error_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+}
+
+export interface QueueStatusResponse {
+  comfyui_url: string;
+  comfy_connected: boolean;
+  comfy_error?: string | null;
+  running: QueueTaskItem[];
+  pending: QueueTaskItem[];
+  recent: QueueTaskItem[];
+  fetched_at: string;
+}

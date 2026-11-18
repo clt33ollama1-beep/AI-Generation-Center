@@ -3,6 +3,7 @@ import json
 import re
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
@@ -14,7 +15,7 @@ from sqlmodel import Session
 from app.config import settings
 from app.database import engine
 from app.models import GenerationRecord
-from app.schemas import InputMediaInfo, OutputFileInfo
+from app.schemas import InputMediaInfo, OutputFileInfo, QueueStatusResponse, QueueTaskItem
 
 
 class SSEHub:
@@ -40,6 +41,220 @@ class SSEHub:
 
 
 sse_hub = SSEHub()
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class QueueRegistry:
+    def __init__(self) -> None:
+        self._tasks: dict[str, dict[str, Any]] = {}
+
+    def register(self, task: QueueTaskItem, started_monotonic: float) -> None:
+        data = task.model_dump()
+        data["_started_monotonic"] = started_monotonic
+        self._tasks[task.prompt_id] = data
+        if len(self._tasks) > 60:
+            finished_keys = [
+                pid
+                for pid, item in self._tasks.items()
+                if item.get("state") in {"completed", "failed", "cancelled"}
+            ]
+            for pid in finished_keys[: max(0, len(self._tasks) - 40)]:
+                self._tasks.pop(pid, None)
+
+    def update(self, prompt_id: str, **patch: Any) -> None:
+        item = self._tasks.get(prompt_id)
+        if not item:
+            return
+        item.update(patch)
+
+    def get(self, prompt_id: str) -> dict[str, Any] | None:
+        return self._tasks.get(prompt_id)
+
+    def to_item(self, raw: dict[str, Any], **overrides: Any) -> QueueTaskItem:
+        merged = {k: v for k, v in raw.items() if k != "_started_monotonic"}
+        merged.update(overrides)
+        return QueueTaskItem(**merged)
+
+    def all_items(self) -> list[dict[str, Any]]:
+        return list(self._tasks.values())
+
+
+queue_registry = QueueRegistry()
+
+
+def _build_queue_item_from_entry(
+    entry: Any, state: str, position: int
+) -> QueueTaskItem | None:
+    if not isinstance(entry, list) or len(entry) < 2:
+        return None
+    try:
+        queue_number = int(entry[0]) if entry[0] is not None else None
+    except (TypeError, ValueError):
+        queue_number = None
+    prompt_id = str(entry[1] or "").strip()
+    if not prompt_id:
+        return None
+
+    prompt_graph = entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {}
+    node_count = len(prompt_graph)
+    tracked = queue_registry.get(prompt_id)
+    if tracked:
+        return queue_registry.to_item(
+            tracked,
+            queue_number=queue_number,
+            queue_position=position,
+            state=state,
+            node_count=tracked.get("node_count") or node_count,
+        )
+
+    return QueueTaskItem(
+        prompt_id=prompt_id,
+        client_id=None,
+        queue_number=queue_number,
+        queue_position=position,
+        state="running" if state == "running" else "queued",
+        workflow_id=None,
+        workflow_name="External ComfyUI Job",
+        category_name="External",
+        source="external",
+        node_count=node_count,
+        submitted_inputs={},
+    )
+
+
+async def fetch_queue_status(comfyui_url: str) -> QueueStatusResponse:
+    url = comfyui_url.rstrip("/")
+    comfy_connected = False
+    comfy_error: str | None = None
+    running: list[QueueTaskItem] = []
+    pending: list[QueueTaskItem] = []
+    active_ids: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=3.5) as client:
+            resp = await client.get(f"{url}/queue")
+            if resp.status_code != 200:
+                comfy_error = f"HTTP {resp.status_code} from {url}/queue"
+            else:
+                comfy_connected = True
+                payload = resp.json()
+                raw_running = payload.get("queue_running") or []
+                raw_pending = payload.get("queue_pending") or []
+                if isinstance(raw_running, list):
+                    for entry in raw_running:
+                        item = _build_queue_item_from_entry(entry, "running", 0)
+                        if item:
+                            active_ids.add(item.prompt_id)
+                            running.append(item)
+                if isinstance(raw_pending, list):
+                    for idx, entry in enumerate(raw_pending):
+                        item = _build_queue_item_from_entry(entry, "queued", idx + 1)
+                        if item:
+                            active_ids.add(item.prompt_id)
+                            pending.append(item)
+    except Exception as exc:
+        comfy_error = str(exc)
+
+    if not comfy_connected:
+        for raw in queue_registry.all_items():
+            pid = str(raw.get("prompt_id") or "")
+            if not pid or pid in active_ids:
+                continue
+            if raw.get("state") == "running":
+                active_ids.add(pid)
+                running.append(queue_registry.to_item(raw))
+            elif raw.get("state") == "queued":
+                active_ids.add(pid)
+                pending.append(
+                    queue_registry.to_item(raw, queue_position=len(pending) + 1)
+                )
+
+    recent_raw = [
+        raw
+        for raw in queue_registry.all_items()
+        if str(raw.get("prompt_id") or "") not in active_ids
+        and raw.get("state") in {"completed", "failed", "cancelled"}
+    ]
+    recent_raw.sort(
+        key=lambda x: str(x.get("finished_at") or x.get("started_at") or ""),
+        reverse=True,
+    )
+    recent = [queue_registry.to_item(raw) for raw in recent_raw[:20]]
+
+    return QueueStatusResponse(
+        comfyui_url=url,
+        comfy_connected=comfy_connected,
+        comfy_error=comfy_error,
+        running=running,
+        pending=pending,
+        recent=recent,
+        fetched_at=_utc_iso(),
+    )
+
+
+async def interrupt_comfy_queue(comfyui_url: str) -> None:
+    url = comfyui_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        resp = await client.post(f"{url}/interrupt")
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"ComfyUI interrupt failed ({resp.status_code}): {resp.text}"
+            )
+
+
+async def cancel_comfy_queued_task(comfyui_url: str, prompt_id: str) -> None:
+    url = comfyui_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        resp = await client.post(f"{url}/queue", json={"delete": [prompt_id]})
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"ComfyUI cancel failed ({resp.status_code}): {resp.text}"
+            )
+    existing = queue_registry.get(prompt_id)
+    if existing:
+        started_mono = existing.get("_started_monotonic")
+        duration_ms = (
+            int((time.monotonic() - started_mono) * 1000)
+            if isinstance(started_mono, (int, float))
+            else None
+        )
+        queue_registry.update(
+            prompt_id,
+            state="cancelled",
+            error_message="Removed from queue",
+            finished_at=_utc_iso(),
+            duration_ms=duration_ms,
+        )
+
+
+async def clear_comfy_pending_queue(comfyui_url: str) -> None:
+    url = comfyui_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        resp = await client.post(f"{url}/queue", json={"clear": True})
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"ComfyUI queue clear failed ({resp.status_code}): {resp.text}"
+            )
+    now_iso = _utc_iso()
+    for raw in queue_registry.all_items():
+        if raw.get("state") == "queued":
+            pid = str(raw["prompt_id"])
+            started_mono = raw.get("_started_monotonic")
+            duration_ms = (
+                int((time.monotonic() - started_mono) * 1000)
+                if isinstance(started_mono, (int, float))
+                else None
+            )
+            queue_registry.update(
+                pid,
+                state="cancelled",
+                error_message="Cleared from queue",
+                finished_at=now_iso,
+                duration_ms=duration_ms,
+            )
 
 
 def to_ws_url(comfyui_url: str, client_id: str) -> str:
@@ -286,6 +501,23 @@ async def queue_and_track_generation(
             )
 
     started_at = time.monotonic()
+    queue_registry.register(
+        QueueTaskItem(
+            prompt_id=prompt_id,
+            client_id=client_id,
+            state="queued",
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            category_name=category_name,
+            source="comfycentre",
+            node_count=len(workflow_payload),
+            progress_percent=0,
+            submitted_inputs=submitted_inputs,
+            started_at=_utc_iso(),
+        ),
+        started_monotonic=started_at,
+    )
+
     asyncio.create_task(
         _watch_ws_until_done(
             ws_conn=ws_conn,
@@ -357,6 +589,12 @@ async def _watch_ws_until_done(
                     or node_meta.get("class_type")
                     or f"Node {node_id_str}"
                 )
+                queue_registry.update(
+                    prompt_id,
+                    state="running",
+                    current_node_id=node_id_str,
+                    current_node_title=node_title,
+                )
                 await sse_hub.emit(
                     client_id,
                     {
@@ -372,6 +610,13 @@ async def _watch_ws_until_done(
                 value = int(data.get("value", 0))
                 max_val = int(data.get("max", 1))
                 percent = round((value / max_val) * 100) if max_val > 0 else 0
+                queue_registry.update(
+                    prompt_id,
+                    state="running",
+                    step_value=value,
+                    step_max=max_val,
+                    progress_percent=percent,
+                )
                 await sse_hub.emit(
                     client_id,
                     {
@@ -383,8 +628,34 @@ async def _watch_ws_until_done(
                         "percent": percent,
                     },
                 )
+            elif msg_type == "execution_interrupted":
+                err_msg = "Generation interrupted by user"
+                queue_registry.update(
+                    prompt_id,
+                    state="cancelled",
+                    error_message=err_msg,
+                    finished_at=_utc_iso(),
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
+                await sse_hub.emit(
+                    client_id,
+                    {
+                        "type": "error",
+                        "client_id": client_id,
+                        "prompt_id": prompt_id,
+                        "message": err_msg,
+                    },
+                )
+                return
             elif msg_type == "execution_error":
                 err_msg = str(data.get("exception_message") or "ComfyUI execution error")
+                queue_registry.update(
+                    prompt_id,
+                    state="failed",
+                    error_message=err_msg,
+                    finished_at=_utc_iso(),
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
                 await sse_hub.emit(
                     client_id,
                     {
@@ -442,6 +713,16 @@ async def _watch_ws_until_done(
                 "created_at": record.created_at,
             }
 
+        queue_registry.update(
+            prompt_id,
+            state="completed",
+            progress_percent=100,
+            current_node_id=None,
+            current_node_title=None,
+            finished_at=_utc_iso(),
+            duration_ms=duration_ms,
+        )
+
         await sse_hub.emit(
             client_id,
             {
@@ -454,6 +735,13 @@ async def _watch_ws_until_done(
             },
         )
     except Exception as exc:
+        queue_registry.update(
+            prompt_id,
+            state="failed",
+            error_message=str(exc),
+            finished_at=_utc_iso(),
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
         await sse_hub.emit(
             client_id,
             {

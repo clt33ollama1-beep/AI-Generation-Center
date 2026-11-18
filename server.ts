@@ -19,6 +19,7 @@ import type {
   InspectedNode,
   OutputFileInfo,
   ProgressEventPayload,
+  QueueTaskItem,
   UIInputField,
   WidgetType,
 } from './src/types/comfy.ts';
@@ -396,8 +397,85 @@ function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
   };
 }
 
-// SSE client registry
+// SSE client registry & active/recent task queue tracker
 const sseClients = new Map<string, Set<Response>>();
+const trackedTasks = new Map<string, QueueTaskItem & { _startedAtMs?: number }>();
+
+function registerQueuedTask(task: QueueTaskItem, startedAtMs: number): void {
+  trackedTasks.set(task.prompt_id, { ...task, _startedAtMs: startedAtMs });
+  if (trackedTasks.size > 60) {
+    const finishedKeys = Array.from(trackedTasks.entries())
+      .filter(([, t]) => t.state === 'completed' || t.state === 'failed' || t.state === 'cancelled')
+      .map(([k]) => k);
+    for (const k of finishedKeys.slice(0, Math.max(0, trackedTasks.size - 40))) {
+      trackedTasks.delete(k);
+    }
+  }
+}
+
+function updateTrackedTask(
+  promptId: string,
+  patch: Partial<QueueTaskItem>,
+): void {
+  const existing = trackedTasks.get(promptId);
+  if (!existing) return;
+  trackedTasks.set(promptId, { ...existing, ...patch });
+}
+
+function stripInternalTaskFields(task: QueueTaskItem & { _startedAtMs?: number }): QueueTaskItem {
+  const { _startedAtMs: _ignored, ...rest } = task;
+  return rest;
+}
+
+function buildQueueItemFromComfyEntry(
+  entry: unknown,
+  state: 'running' | 'queued',
+  position: number,
+): QueueTaskItem | null {
+  if (!Array.isArray(entry) || entry.length < 2) return null;
+  const queueNumber = typeof entry[0] === 'number' ? entry[0] : Number(entry[0]) || null;
+  const promptId = String(entry[1] || '');
+  if (!promptId) return null;
+
+  const promptGraph =
+    entry[2] && typeof entry[2] === 'object' && !Array.isArray(entry[2])
+      ? (entry[2] as Record<string, unknown>)
+      : {};
+  const nodeCount = Object.keys(promptGraph).length;
+  const tracked = trackedTasks.get(promptId);
+  if (tracked) {
+    return {
+      ...stripInternalTaskFields(tracked),
+      queue_number: queueNumber,
+      queue_position: position,
+      state,
+      node_count: tracked.node_count || nodeCount,
+    };
+  }
+
+  return {
+    prompt_id: promptId,
+    client_id: null,
+    queue_number: queueNumber,
+    queue_position: position,
+    state,
+    workflow_id: null,
+    workflow_name: 'External ComfyUI Job',
+    category_name: 'External',
+    source: 'external',
+    node_count: nodeCount,
+    current_node_id: null,
+    current_node_title: null,
+    step_value: null,
+    step_max: null,
+    progress_percent: 0,
+    submitted_inputs: {},
+    error_message: null,
+    started_at: null,
+    finished_at: null,
+    duration_ms: null,
+  };
+}
 
 function emitSseEvent(clientId: string, payload: ProgressEventPayload): void {
   const listeners = sseClients.get(clientId);
@@ -1006,6 +1084,171 @@ app.get('/api/progress/:clientId', (req: Request, res: Response) => {
   });
 });
 
+// Queue Monitoring & Control
+app.get('/api/queue', async (_req: Request, res: Response) => {
+  const comfyUrl = getComfyUiUrl();
+  let comfyConnected = false;
+  let comfyError: string | null = null;
+  const running: QueueTaskItem[] = [];
+  const pending: QueueTaskItem[] = [];
+  const activeIds = new Set<string>();
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const response = await fetch(`${comfyUrl}/queue`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) {
+      comfyError = `HTTP ${response.status} from ${comfyUrl}/queue`;
+    } else {
+      comfyConnected = true;
+      const payload = (await response.json()) as {
+        queue_running?: unknown[];
+        queue_pending?: unknown[];
+      };
+      const rawRunning = Array.isArray(payload.queue_running) ? payload.queue_running : [];
+      const rawPending = Array.isArray(payload.queue_pending) ? payload.queue_pending : [];
+
+      for (const entry of rawRunning) {
+        const item = buildQueueItemFromComfyEntry(entry, 'running', 0);
+        if (item) {
+          activeIds.add(item.prompt_id);
+          running.push(item);
+        }
+      }
+      rawPending.forEach((entry, idx) => {
+        const item = buildQueueItemFromComfyEntry(entry, 'queued', idx + 1);
+        if (item) {
+          activeIds.add(item.prompt_id);
+          pending.push(item);
+        }
+      });
+    }
+  } catch (err) {
+    comfyError = err instanceof Error ? err.message : `Unable to reach ComfyUI at ${comfyUrl}`;
+  }
+
+  // Include locally tracked queued/running tasks when ComfyUI is temporarily unreachable
+  if (!comfyConnected) {
+    for (const task of trackedTasks.values()) {
+      if (task.state === 'running' && !activeIds.has(task.prompt_id)) {
+        activeIds.add(task.prompt_id);
+        running.push(stripInternalTaskFields(task));
+      } else if (task.state === 'queued' && !activeIds.has(task.prompt_id)) {
+        activeIds.add(task.prompt_id);
+        pending.push({
+          ...stripInternalTaskFields(task),
+          queue_position: pending.length + 1,
+        });
+      }
+    }
+  }
+
+  const recent = Array.from(trackedTasks.values())
+    .filter(
+      (t) =>
+        !activeIds.has(t.prompt_id) &&
+        (t.state === 'completed' || t.state === 'failed' || t.state === 'cancelled'),
+    )
+    .sort((a, b) => (b.finished_at || b.started_at || '').localeCompare(a.finished_at || a.started_at || ''))
+    .slice(0, 20)
+    .map(stripInternalTaskFields);
+
+  res.json({
+    comfyui_url: comfyUrl,
+    comfy_connected: comfyConnected,
+    comfy_error: comfyError,
+    running,
+    pending,
+    recent,
+    fetched_at: new Date().toISOString(),
+  });
+});
+
+app.post('/api/queue/interrupt', async (_req: Request, res: Response) => {
+  const comfyUrl = getComfyUiUrl();
+  try {
+    const response = await fetch(`${comfyUrl}/interrupt`, { method: 'POST' });
+    if (!response.ok) {
+      const text = await response.text();
+      res.status(502).json({ detail: `ComfyUI interrupt failed (${response.status}): ${text}` });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({
+      detail: err instanceof Error ? err.message : 'Unable to interrupt running task on ComfyUI',
+    });
+  }
+});
+
+app.post('/api/queue/cancel', async (req: Request, res: Response) => {
+  const promptId = String(req.body?.prompt_id || '').trim();
+  if (!promptId) {
+    res.status(400).json({ detail: 'prompt_id is required' });
+    return;
+  }
+  const comfyUrl = getComfyUiUrl();
+  try {
+    const response = await fetch(`${comfyUrl}/queue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delete: [promptId] }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      res.status(502).json({ detail: `ComfyUI cancel failed (${response.status}): ${text}` });
+      return;
+    }
+    const existing = trackedTasks.get(promptId);
+    if (existing) {
+      updateTrackedTask(promptId, {
+        state: 'cancelled',
+        error_message: 'Removed from queue',
+        finished_at: new Date().toISOString(),
+        duration_ms: existing._startedAtMs ? Date.now() - existing._startedAtMs : null,
+      });
+    }
+    res.json({ ok: true, deleted: promptId });
+  } catch (err) {
+    res.status(502).json({
+      detail: err instanceof Error ? err.message : 'Unable to cancel queued task on ComfyUI',
+    });
+  }
+});
+
+app.post('/api/queue/clear', async (_req: Request, res: Response) => {
+  const comfyUrl = getComfyUiUrl();
+  try {
+    const response = await fetch(`${comfyUrl}/queue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clear: true }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      res.status(502).json({ detail: `ComfyUI queue clear failed (${response.status}): ${text}` });
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    for (const [pid, task] of trackedTasks.entries()) {
+      if (task.state === 'queued') {
+        updateTrackedTask(pid, {
+          state: 'cancelled',
+          error_message: 'Cleared from queue',
+          finished_at: nowIso,
+          duration_ms: task._startedAtMs ? Date.now() - task._startedAtMs : null,
+        });
+      }
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({
+      detail: err instanceof Error ? err.message : 'Unable to clear ComfyUI queue',
+    });
+  }
+});
+
 // Execute Workflow Generation
 app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
   const workflowId = Number(req.body?.workflow_id);
@@ -1245,6 +1488,32 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
     }
   }
 
+  registerQueuedTask(
+    {
+      prompt_id: promptId,
+      client_id: clientId,
+      queue_number: null,
+      queue_position: null,
+      state: 'queued',
+      workflow_id: workflowTemplate.id,
+      workflow_name: workflowTemplate.name,
+      category_name: workflowTemplate.category_name,
+      source: 'comfycentre',
+      node_count: Object.keys(workflowCopy).length,
+      current_node_id: null,
+      current_node_title: null,
+      step_value: null,
+      step_max: null,
+      progress_percent: 0,
+      submitted_inputs: submittedInputs,
+      error_message: null,
+      started_at: new Date(startedAt).toISOString(),
+      finished_at: null,
+      duration_ms: null,
+    },
+    startedAt,
+  );
+
   // Return immediately with prompt_id; WebSocket watcher continues in background and streams SSE
   res.status(202).json({
     prompt_id: promptId,
@@ -1309,6 +1578,15 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
         .get(Number(insertResult.lastInsertRowid));
       const generation = mapGenerationRow(savedRow!);
 
+      updateTrackedTask(promptId, {
+        state: 'completed',
+        progress_percent: 100,
+        current_node_id: null,
+        current_node_title: null,
+        finished_at: new Date().toISOString(),
+        duration_ms: durationMs,
+      });
+
       emitSseEvent(clientId, {
         type: 'completed',
         client_id: clientId,
@@ -1319,6 +1597,12 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to retrieve ComfyUI outputs';
+      updateTrackedTask(promptId, {
+        state: 'failed',
+        error_message: msg,
+        finished_at: new Date().toISOString(),
+        duration_ms: Date.now() - startedAt,
+      });
       emitSseEvent(clientId, {
         type: 'error',
         client_id: clientId,
@@ -1351,6 +1635,11 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       } else {
         const nodeMeta = workflowCopy[nodeId];
         const nodeTitle = nodeMeta?._meta?.title || nodeMeta?.class_type || `Node ${nodeId}`;
+        updateTrackedTask(promptId, {
+          state: 'running',
+          current_node_id: nodeId,
+          current_node_title: nodeTitle,
+        });
         emitSseEvent(clientId, {
           type: 'executing',
           client_id: clientId,
@@ -1364,6 +1653,12 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       const value = Number(data.value || 0);
       const max = Number(data.max || 1);
       const percent = max > 0 ? Math.round((value / max) * 100) : 0;
+      updateTrackedTask(promptId, {
+        state: 'running',
+        step_value: value,
+        step_max: max,
+        progress_percent: percent,
+      });
       emitSseEvent(clientId, {
         type: 'progress',
         client_id: clientId,
@@ -1372,10 +1667,32 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
         max,
         percent,
       });
+    } else if (msgType === 'execution_interrupted') {
+      finished = true;
+      ws.close();
+      const errMsg = 'Generation interrupted by user';
+      updateTrackedTask(promptId, {
+        state: 'cancelled',
+        error_message: errMsg,
+        finished_at: new Date().toISOString(),
+        duration_ms: Date.now() - startedAt,
+      });
+      emitSseEvent(clientId, {
+        type: 'error',
+        client_id: clientId,
+        prompt_id: promptId,
+        message: errMsg,
+      });
     } else if (msgType === 'execution_error') {
       finished = true;
       ws.close();
       const errMsg = String(data.exception_message || 'ComfyUI execution error');
+      updateTrackedTask(promptId, {
+        state: 'failed',
+        error_message: errMsg,
+        finished_at: new Date().toISOString(),
+        duration_ms: Date.now() - startedAt,
+      });
       emitSseEvent(clientId, {
         type: 'error',
         client_id: clientId,
@@ -1388,11 +1705,18 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
   ws.on('error', (err) => {
     if (!finished) {
       finished = true;
+      const errMsg = err.message || 'ComfyUI WebSocket disconnected';
+      updateTrackedTask(promptId, {
+        state: 'failed',
+        error_message: errMsg,
+        finished_at: new Date().toISOString(),
+        duration_ms: Date.now() - startedAt,
+      });
       emitSseEvent(clientId, {
         type: 'error',
         client_id: clientId,
         prompt_id: promptId,
-        message: err.message || 'ComfyUI WebSocket disconnected',
+        message: errMsg,
       });
     }
   });
