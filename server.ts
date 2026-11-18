@@ -91,14 +91,36 @@ if (!generationCols.some((c) => c.name === 'input_media_json')) {
 }
 
 function slugify(value: string): string {
-  const ascii = value
+  const trimmed = value.trim();
+  const ascii = trimmed
     .toLowerCase()
-    .trim()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  if (ascii) return ascii;
-  const hash = crypto.createHash('sha1').update(value.trim()).digest('hex').slice(0, 8);
-  return `category-${hash}`;
+  const hasNonAscii = /[^\x00-\x7f]/.test(trimmed);
+  if (ascii && !hasNonAscii) return ascii;
+  const hash = crypto.createHash('sha1').update(trimmed).digest('hex').slice(0, 8);
+  return ascii ? `${ascii}-${hash}` : `category-${hash}`;
+}
+
+function ensureUniqueCategorySlug(value: string, excludeId?: number): string {
+  const base = slugify(value);
+  let candidate = base;
+  let counter = 2;
+  while (true) {
+    const existing =
+      excludeId !== undefined
+        ? (db.prepare('SELECT id FROM categories WHERE slug = ? AND id != ? LIMIT 1').get(candidate, excludeId) as
+            | { id: number }
+            | undefined)
+        : (db.prepare('SELECT id FROM categories WHERE slug = ? LIMIT 1').get(candidate) as
+            | { id: number }
+            | undefined);
+    if (!existing) {
+      return candidate;
+    }
+    candidate = `${base}-${counter}`;
+    counter += 1;
+  }
 }
 
 function getOrCreateUncategorizedCategoryId(): number {
@@ -314,41 +336,47 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
   });
 }
 
+function safeJsonParse<T>(raw: unknown, fallback: T): T {
+  try {
+    return JSON.parse(String(raw ?? '')) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 function mapWorkflowRow(row: Record<string, unknown>) {
   let outputNodeIds: string[] = [];
-  try {
-    const parsed = JSON.parse(String(row.output_node_ids_json || '[]'));
-    if (Array.isArray(parsed)) {
-      outputNodeIds = parsed.map((id) => String(id));
-    }
-  } catch {
-    outputNodeIds = [];
+  const parsedOutputIds = safeJsonParse<unknown>(row.output_node_ids_json, []);
+  if (Array.isArray(parsedOutputIds)) {
+    outputNodeIds = parsedOutputIds.map((id) => String(id));
   }
+  const comfyApiJson = safeJsonParse<ComfyApiWorkflow>(row.comfy_api_json, {});
+  const uiInputs = safeJsonParse<UIInputField[]>(row.ui_inputs_json, []);
   return {
     id: Number(row.id),
     name: String(row.name),
     description: String(row.description || ''),
     category_id: Number(row.category_id),
-    category_name: String(row.category_name || ''),
+    category_name: String(row.category_name || 'Uncategorized'),
     output_type: String(row.output_type || 'auto'),
     output_node_ids: outputNodeIds,
-    comfy_api_json: JSON.parse(String(row.comfy_api_json)) as ComfyApiWorkflow,
-    ui_inputs: JSON.parse(String(row.ui_inputs_json)) as UIInputField[],
+    comfy_api_json: comfyApiJson && typeof comfyApiJson === 'object' ? comfyApiJson : {},
+    ui_inputs: Array.isArray(uiInputs) ? uiInputs : [],
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
   };
 }
 
 function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
-  let inputMedia: InputMediaInfo[] = [];
-  try {
-    const parsed = JSON.parse(String(row.input_media_json || '[]'));
-    if (Array.isArray(parsed)) {
-      inputMedia = parsed as InputMediaInfo[];
-    }
-  } catch {
-    inputMedia = [];
-  }
+  const parsedInputMedia = safeJsonParse<unknown>(row.input_media_json, []);
+  const inputMedia = Array.isArray(parsedInputMedia) ? (parsedInputMedia as InputMediaInfo[]) : [];
+  const parsedOutputs = safeJsonParse<unknown>(row.outputs_json, []);
+  const outputs = Array.isArray(parsedOutputs) ? (parsedOutputs as OutputFileInfo[]) : [];
+  const parsedSubmitted = safeJsonParse<unknown>(row.submitted_inputs_json, {});
+  const submittedInputs =
+    parsedSubmitted && typeof parsedSubmitted === 'object' && !Array.isArray(parsedSubmitted)
+      ? (parsedSubmitted as Record<string, unknown>)
+      : {};
   return {
     id: Number(row.id),
     workflow_id: Number(row.workflow_id),
@@ -359,9 +387,9 @@ function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
     status: String(row.status) as GenerationRecord['status'],
     media_type: String(row.media_type) as GenerationRecord['media_type'],
     primary_output_url: String(row.primary_output_url),
-    outputs: JSON.parse(String(row.outputs_json)) as OutputFileInfo[],
+    outputs,
     input_media: inputMedia,
-    submitted_inputs: JSON.parse(String(row.submitted_inputs_json)) as Record<string, unknown>,
+    submitted_inputs: submittedInputs,
     duration_ms: Number(row.duration_ms || 0),
     error_message: row.error_message ? String(row.error_message) : null,
     created_at: String(row.created_at),
@@ -597,7 +625,12 @@ app.post('/api/categories', (req: Request, res: Response) => {
     res.status(400).json({ detail: 'Category name is required' });
     return;
   }
-  const slug = slugify(name);
+  const duplicate = db.prepare('SELECT id FROM categories WHERE name = ? LIMIT 1').get(name);
+  if (duplicate) {
+    res.status(409).json({ detail: `Category "${name}" already exists` });
+    return;
+  }
+  const slug = ensureUniqueCategorySlug(name);
   try {
     const result = db
       .prepare('INSERT INTO categories (name, slug, description, sort_order) VALUES (?, ?, ?, ?)')
@@ -615,7 +648,13 @@ app.post('/api/categories', (req: Request, res: Response) => {
 
 app.put('/api/categories/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ detail: 'Invalid category id' });
+    return;
+  }
+  const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as
+    | { id: number; name: string; slug: string; description: string; sort_order: number }
+    | undefined;
   if (!existing) {
     res.status(404).json({ detail: 'Category not found' });
     return;
@@ -625,9 +664,17 @@ app.put('/api/categories/:id', (req: Request, res: Response) => {
     res.status(400).json({ detail: 'Category name is required' });
     return;
   }
-  const description = String(req.body?.description ?? existing.description).trim();
-  const sortOrder = Number(req.body?.sort_order ?? existing.sort_order);
-  const slug = slugify(name);
+  const duplicate = db
+    .prepare('SELECT id FROM categories WHERE name = ? AND id != ? LIMIT 1')
+    .get(name, id);
+  if (duplicate) {
+    res.status(409).json({ detail: `Category "${name}" already exists` });
+    return;
+  }
+  const description = String(req.body?.description ?? existing.description ?? '').trim();
+  const rawSort = req.body?.sort_order ?? existing.sort_order ?? 0;
+  const sortOrder = Number.isFinite(Number(rawSort)) ? Number(rawSort) : 0;
+  const slug = ensureUniqueCategorySlug(name, id);
   try {
     db.prepare(
       'UPDATE categories SET name = ?, slug = ?, description = ?, sort_order = ? WHERE id = ?',
@@ -715,10 +762,10 @@ app.post('/api/workflows/inspect', (req: Request, res: Response) => {
 app.get('/api/workflows', (_req: Request, res: Response) => {
   const rows = db
     .prepare(`
-      SELECT w.*, c.name AS category_name
+      SELECT w.*, COALESCE(c.name, 'Uncategorized') AS category_name
       FROM workflows w
-      JOIN categories c ON c.id = w.category_id
-      ORDER BY c.sort_order ASC, w.name ASC
+      LEFT JOIN categories c ON c.id = w.category_id
+      ORDER BY COALESCE(c.sort_order, 999) ASC, w.name ASC
     `)
     .all();
   res.json(rows.map(mapWorkflowRow));
@@ -728,9 +775,9 @@ app.get('/api/workflows/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const row = db
     .prepare(`
-      SELECT w.*, c.name AS category_name
+      SELECT w.*, COALESCE(c.name, 'Uncategorized') AS category_name
       FROM workflows w
-      JOIN categories c ON c.id = w.category_id
+      LEFT JOIN categories c ON c.id = w.category_id
       WHERE w.id = ?
     `)
     .get(id);

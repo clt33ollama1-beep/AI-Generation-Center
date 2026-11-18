@@ -69,7 +69,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   const [addingCategory, setAddingCategory] = useState(false);
   const [editingCatId, setEditingCatId] = useState<number | null>(null);
   const [editingCatName, setEditingCatName] = useState('');
+  const [savingCategoryId, setSavingCategoryId] = useState<number | null>(null);
   const [confirmDeleteCatId, setConfirmDeleteCatId] = useState<number | null>(null);
+  const [categoryError, setCategoryError] = useState<string | null>(null);
   const [inspecting, setInspecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -375,33 +377,43 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
 
   const handleCreateCategory = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newCategoryName.trim()) return;
+    const trimmed = newCategoryName.trim();
+    if (!trimmed) return;
     try {
-      const created = await api.createCategory({ name: newCategoryName.trim() });
+      setCategoryError(null);
+      setError(null);
+      const created = await api.createCategory({ name: trimmed });
       setNewCategoryName('');
       setAddingCategory(false);
       await onRefreshData();
       setCategoryId(created.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create category');
+      const msg = err instanceof Error ? err.message : 'Failed to create category';
+      setCategoryError(msg);
+      setError(msg);
     }
   };
 
   const handleStartEditCategory = (cat: Category) => {
     setConfirmDeleteCatId(null);
     setEditingCatId(cat.id);
-    setEditingCatName(cat.name);
+    setEditingCatName(cat.name || '');
+    setCategoryError(null);
     setError(null);
   };
 
   const handleSaveCategoryEdit = async (e: React.FormEvent, id: number) => {
     e.preventDefault();
+    if (savingCategoryId === id) return;
     const trimmed = editingCatName.trim();
     if (!trimmed) {
+      setCategoryError('Category name is required');
       setError('Category name is required');
       return;
     }
     try {
+      setSavingCategoryId(id);
+      setCategoryError(null);
       setError(null);
       const updated = await api.updateCategory(id, { name: trimmed });
       setEditingCatId(null);
@@ -409,12 +421,17 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       await onRefreshData();
       setNotice(`Updated category to "${updated.name}".`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update category');
+      const msg = err instanceof Error ? err.message : 'Failed to update category';
+      setCategoryError(msg);
+      setError(msg);
+    } finally {
+      setSavingCategoryId(null);
     }
   };
 
   const handleDeleteCategory = async (cat: Category) => {
     try {
+      setCategoryError(null);
       setError(null);
       const result = await api.deleteCategory(cat.id);
       setConfirmDeleteCatId(null);
@@ -438,7 +455,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
         setNotice(`Deleted category "${cat.name}".`);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete category');
+      const msg = err instanceof Error ? err.message : 'Failed to delete category';
+      setCategoryError(msg);
+      setError(msg);
     }
   };
 
@@ -459,15 +478,30 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-5">
+          {categoryError && (
+            <div className="p-2.5 rounded border border-red-900/60 bg-red-950/30 text-[11px] text-red-300 flex items-start justify-between gap-2">
+              <span className="break-words">{categoryError}</span>
+              <button
+                type="button"
+                onClick={() => setCategoryError(null)}
+                className="text-red-400 hover:text-red-200 cursor-pointer shrink-0"
+                aria-label="Dismiss category error"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+
           {categories.map((cat) => {
             const catWorkflows = workflows.filter((w) => w.category_id === cat.id);
             const isUncategorized =
-              cat.slug.toLowerCase() === 'uncategorized' ||
-              cat.name.trim().toLowerCase() === 'uncategorized';
+              (cat.slug || '').toLowerCase() === 'uncategorized' ||
+              (cat.name || '').trim().toLowerCase() === 'uncategorized';
             const canDeleteCategory =
               !(isUncategorized && (catWorkflows.length > 0 || categories.length <= 1));
             const isEditingThisCat = editingCatId === cat.id;
             const isConfirmingDelete = confirmDeleteCatId === cat.id;
+            const isSavingThisCat = savingCategoryId === cat.id;
 
             return (
               <div key={cat.id} className="space-y-1.5">
@@ -479,30 +513,39 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                     <input
                       type="text"
                       autoFocus
+                      disabled={isSavingThisCat}
                       value={editingCatName}
                       onChange={(e) => setEditingCatName(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === 'Escape') {
+                        if (e.key === 'Enter' && e.nativeEvent.isComposing) {
+                          e.preventDefault();
+                        } else if (e.key === 'Escape') {
                           setEditingCatId(null);
+                          setCategoryError(null);
                         }
                       }}
                       aria-label="Edit category name"
-                      className="flex-1 min-w-0 px-2 py-1 text-xs bg-[#0B0D11] border border-blue-500 rounded text-zinc-100 focus:outline-none"
+                      className="flex-1 min-w-0 px-2 py-1 text-xs bg-[#0B0D11] border border-blue-500 rounded text-zinc-100 focus:outline-none disabled:opacity-60"
                     />
                     <button
                       type="submit"
+                      disabled={isSavingThisCat}
                       title="Save category name"
                       aria-label="Save category name"
-                      className="p-1 text-emerald-400 hover:bg-zinc-800 rounded cursor-pointer shrink-0"
+                      className="p-1 text-emerald-400 hover:bg-zinc-800 rounded cursor-pointer shrink-0 disabled:opacity-50"
                     >
                       <Check className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"
-                      onClick={() => setEditingCatId(null)}
+                      disabled={isSavingThisCat}
+                      onClick={() => {
+                        setEditingCatId(null);
+                        setCategoryError(null);
+                      }}
                       title="Cancel"
                       aria-label="Cancel category edit"
-                      className="p-1 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded cursor-pointer shrink-0"
+                      className="p-1 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded cursor-pointer shrink-0 disabled:opacity-50"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -621,6 +664,14 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                 autoFocus
                 value={newCategoryName}
                 onChange={(e) => setNewCategoryName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                  } else if (e.key === 'Escape') {
+                    setAddingCategory(false);
+                    setNewCategoryName('');
+                  }
+                }}
                 placeholder="Category name"
                 className="flex-1 px-2.5 py-1.5 text-xs bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
               />

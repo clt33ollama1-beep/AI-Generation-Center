@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import uuid
@@ -72,14 +73,38 @@ app.add_middleware(
 app.mount("/outputs", StaticFiles(directory=str(settings.outputs_path)), name="outputs")
 
 
-import hashlib
-
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower().strip()).strip("-")
-    if slug:
-        return slug
-    digest = hashlib.sha1(value.strip().encode("utf-8")).hexdigest()[:8]
-    return f"category-{digest}"
+    trimmed = value.strip()
+    ascii_slug = re.sub(r"[^a-z0-9]+", "-", trimmed.lower()).strip("-")
+    has_non_ascii = any(ord(ch) > 127 for ch in trimmed)
+    if ascii_slug and not has_non_ascii:
+        return ascii_slug
+    digest = hashlib.sha1(trimmed.encode("utf-8")).hexdigest()[:8]
+    return f"{ascii_slug}-{digest}" if ascii_slug else f"category-{digest}"
+
+
+def ensure_unique_category_slug(
+    session: Session, value: str, exclude_id: Optional[int] = None
+) -> str:
+    base = slugify(value)
+    candidate = base
+    counter = 2
+    while True:
+        stmt = select(Category).where(Category.slug == candidate)
+        if exclude_id is not None:
+            stmt = stmt.where(Category.id != exclude_id)
+        existing = session.exec(stmt).first()
+        if not existing:
+            return candidate
+        candidate = f"{base}-{counter}"
+        counter += 1
+
+
+def safe_json_loads(raw: Any, fallback: Any) -> Any:
+    try:
+        return json.loads(raw or "")
+    except Exception:
+        return fallback
 
 
 def get_or_create_uncategorized_category_id(session: Session) -> int:
@@ -108,32 +133,46 @@ def get_comfyui_url(session: Session) -> str:
 
 
 def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
-    ui_inputs_raw = json.loads(wf.ui_inputs_json)
-    try:
-        output_node_ids = [str(x) for x in json.loads(wf.output_node_ids_json or "[]")]
-    except Exception:
-        output_node_ids = []
+    ui_inputs_raw = safe_json_loads(wf.ui_inputs_json, [])
+    if not isinstance(ui_inputs_raw, list):
+        ui_inputs_raw = []
+    output_ids_raw = safe_json_loads(wf.output_node_ids_json, [])
+    output_node_ids = [str(x) for x in output_ids_raw] if isinstance(output_ids_raw, list) else []
+    comfy_api_raw = safe_json_loads(wf.comfy_api_json, {})
+    if not isinstance(comfy_api_raw, dict):
+        comfy_api_raw = {}
+    parsed_ui_inputs: list[UIInputField] = []
+    for item in ui_inputs_raw:
+        if isinstance(item, dict):
+            try:
+                parsed_ui_inputs.append(UIInputField(**item))
+            except Exception:
+                continue
     return WorkflowRead(
         id=wf.id or 0,
         name=wf.name,
-        description=wf.description,
+        description=wf.description or "",
         category_id=wf.category_id,
-        category_name=category_name,
+        category_name=category_name or "Uncategorized",
         output_type=wf.output_type,  # type: ignore[arg-type]
         output_node_ids=output_node_ids,
-        comfy_api_json=json.loads(wf.comfy_api_json),
-        ui_inputs=[UIInputField(**item) for item in ui_inputs_raw],
+        comfy_api_json=comfy_api_raw,
+        ui_inputs=parsed_ui_inputs,
         created_at=wf.created_at,
         updated_at=wf.updated_at,
     )
 
 
 def to_generation_read(rec: GenerationRecord) -> GenerationRead:
-    outputs_raw = json.loads(rec.outputs_json or "[]")
-    try:
-        input_media_raw = json.loads(getattr(rec, "input_media_json", "[]") or "[]")
-    except Exception:
+    outputs_raw = safe_json_loads(rec.outputs_json, [])
+    if not isinstance(outputs_raw, list):
+        outputs_raw = []
+    input_media_raw = safe_json_loads(getattr(rec, "input_media_json", "[]"), [])
+    if not isinstance(input_media_raw, list):
         input_media_raw = []
+    submitted_raw = safe_json_loads(rec.submitted_inputs_json, {})
+    if not isinstance(submitted_raw, dict):
+        submitted_raw = {}
     return GenerationRead(
         id=rec.id or 0,
         workflow_id=rec.workflow_id,
@@ -144,9 +183,9 @@ def to_generation_read(rec: GenerationRecord) -> GenerationRead:
         status=rec.status,  # type: ignore[arg-type]
         media_type=rec.media_type,  # type: ignore[arg-type]
         primary_output_url=rec.primary_output_url,
-        outputs=[OutputFileInfo(**o) for o in outputs_raw],
+        outputs=[OutputFileInfo(**o) for o in outputs_raw if isinstance(o, dict)],
         input_media=[InputMediaInfo(**m) for m in input_media_raw if isinstance(m, dict)],
-        submitted_inputs=json.loads(rec.submitted_inputs_json or "{}"),
+        submitted_inputs=submitted_raw,
         duration_ms=rec.duration_ms,
         error_message=rec.error_message,
         created_at=rec.created_at,
@@ -194,9 +233,12 @@ def create_category(payload: CategoryCreate, session: Session = Depends(get_sess
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Category name is required")
+    dup = session.exec(select(Category).where(Category.name == name)).first()
+    if dup:
+        raise HTTPException(status_code=409, detail=f'Category "{name}" already exists')
     cat = Category(
         name=name,
-        slug=slugify(name),
+        slug=ensure_unique_category_slug(session, name),
         description=payload.description.strip(),
         sort_order=payload.sort_order,
     )
@@ -223,8 +265,15 @@ def update_category(
         cleaned_name = payload.name.strip()
         if not cleaned_name:
             raise HTTPException(status_code=400, detail="Category name is required")
+        dup = session.exec(
+            select(Category).where(Category.name == cleaned_name, Category.id != category_id)
+        ).first()
+        if dup:
+            raise HTTPException(
+                status_code=409, detail=f'Category "{cleaned_name}" already exists'
+            )
         cat.name = cleaned_name
-        cat.slug = slugify(cleaned_name)
+        cat.slug = ensure_unique_category_slug(session, cleaned_name, exclude_id=category_id)
     if payload.description is not None:
         cat.description = payload.description.strip()
     if payload.sort_order is not None:
@@ -251,7 +300,8 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
     wf_count = len(affected_workflows)
     total_categories = len(session.exec(select(Category)).all())
     is_uncategorized = (
-        cat.slug.lower() == "uncategorized" or cat.name.strip().lower() == "uncategorized"
+        (cat.slug or "").lower() == "uncategorized"
+        or (cat.name or "").strip().lower() == "uncategorized"
     )
     if is_uncategorized and (wf_count > 0 or total_categories <= 1):
         raise HTTPException(
