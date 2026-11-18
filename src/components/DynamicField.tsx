@@ -1,25 +1,29 @@
 import React, { useEffect, useState } from 'react';
 import { Dices, Lock, Unlock, Upload, X, Film, Image as ImageIcon } from 'lucide-react';
-import type { UIInputField } from '../types/comfy.ts';
+import type { InputMediaInfo, UIInputField } from '../types/comfy.ts';
 
 interface DynamicFieldProps {
   field: UIInputField;
   value: string | number | boolean;
   fileValue: File | null;
+  reusedMedia?: InputMediaInfo | null;
   seedLocked?: boolean;
   onToggleSeedLock?: () => void;
   onChange: (value: string | number | boolean) => void;
   onFileChange: (file: File | null) => void;
+  onClearReusedMedia?: () => void;
 }
 
 export const DynamicField: React.FC<DynamicFieldProps> = ({
   field,
   value,
   fileValue,
+  reusedMedia = null,
   seedLocked = false,
   onToggleSeedLock,
   onChange,
   onFileChange,
+  onClearReusedMedia,
 }) => {
   const [dragOver, setDragOver] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -54,6 +58,15 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
   };
 
   const isVideoFile = fileValue?.type.startsWith('video/');
+  const activePreviewUrl = fileValue && previewUrl ? previewUrl : reusedMedia?.url || null;
+  const activeIsVideo = fileValue ? Boolean(isVideoFile) : reusedMedia?.media_type === 'video';
+  const activeFileName = fileValue
+    ? fileValue.name
+    : reusedMedia
+      ? reusedMedia.original_filename || reusedMedia.comfy_name
+      : '';
+  const legacyMediaName =
+    !activePreviewUrl && typeof value === 'string' && value.trim() ? value.trim() : '';
 
   return (
     <div className="space-y-1.5">
@@ -218,75 +231,121 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
 
       {field.widget === 'image_upload' && (
         <div className="space-y-2">
-          {previewUrl && fileValue ? (
+          {activePreviewUrl ? (
             <div className="relative rounded-md border border-zinc-800 bg-[#0B0D11] overflow-hidden">
-              {isVideoFile ? (
+              {activeIsVideo ? (
                 <video
-                  src={previewUrl}
+                  src={activePreviewUrl}
                   controls
                   muted
                   loop
-                  className="w-full max-h-52 object-contain bg-black"
+                  className="w-full h-52 object-contain bg-black"
                 />
               ) : (
                 <img
-                  src={previewUrl}
-                  alt={fileValue.name}
-                  className="w-full max-h-52 object-contain bg-black/40"
+                  src={activePreviewUrl}
+                  alt={activeFileName || field.label}
+                  className="w-full h-52 object-contain bg-black/40"
                 />
               )}
               <div className="flex items-center justify-between px-3 py-2 border-t border-zinc-800 text-xs">
                 <span className="inline-flex items-center gap-1.5 text-zinc-300 truncate">
-                  {isVideoFile ? (
+                  {activeIsVideo ? (
                     <Film className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                   ) : (
                     <ImageIcon className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                   )}
-                  <span className="truncate">{fileValue.name}</span>
+                  <span className="truncate">{activeFileName}</span>
+                  {!fileValue && reusedMedia && (
+                    <span className="text-[11px] font-mono text-blue-400 shrink-0">(reused)</span>
+                  )}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => onFileChange(null)}
-                  className="inline-flex items-center gap-1 text-zinc-400 hover:text-red-400 transition-colors cursor-pointer shrink-0 ml-2"
-                >
-                  <X className="w-3.5 h-3.5" />
-                  Remove
-                </button>
+                <div className="flex items-center gap-3 shrink-0 ml-2">
+                  <label
+                    htmlFor={`field-${field.id}`}
+                    className="text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+                  >
+                    Replace
+                    <input
+                      id={`field-${field.id}`}
+                      type="file"
+                      accept="image/*,video/*"
+                      className="sr-only"
+                      onChange={(e) => {
+                        const selected = e.target.files?.[0] || null;
+                        if (selected) onFileChange(selected);
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (fileValue) {
+                        onFileChange(null);
+                      } else {
+                        onClearReusedMedia?.();
+                      }
+                    }}
+                    className="inline-flex items-center gap-1 text-zinc-400 hover:text-red-400 transition-colors cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    Remove
+                  </button>
+                </div>
               </div>
             </div>
           ) : (
-            <label
-              htmlFor={`field-${field.id}`}
-              onDragOver={(e) => {
-                e.preventDefault();
-                setDragOver(true);
-              }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={handleDrop}
-              className={`flex flex-col items-center justify-center gap-2 px-4 py-6 rounded-md border border-dashed transition-colors cursor-pointer ${
-                dragOver
-                  ? 'border-blue-500 bg-blue-950/20 text-blue-300'
-                  : 'border-zinc-700/80 bg-[#0B0D11] text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
-              }`}
-            >
-              <Upload className="w-5 h-5" />
-              <span className="text-xs font-medium">
-                Drop reference image or video, or click to browse
-              </span>
-              <span className="text-[11px] text-zinc-500">
-                PNG, JPG, WEBP, MP4, WEBM supported
-              </span>
-              <input
-                id={`field-${field.id}`}
-                type="file"
-                accept="image/*,video/*"
-                className="sr-only"
-                onChange={(e) => {
-                  const selected = e.target.files?.[0] || null;
-                  onFileChange(selected);
+            <>
+              {legacyMediaName && (
+                <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md border border-zinc-800 bg-[#0B0D11] text-xs">
+                  <span className="text-zinc-300 font-mono truncate">
+                    ComfyUI input: {legacyMediaName}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClearReusedMedia?.();
+                      onChange('');
+                    }}
+                    className="text-zinc-400 hover:text-red-400 transition-colors shrink-0 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+              <label
+                htmlFor={`field-${field.id}`}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragOver(true);
                 }}
-              />
-            </label>
+                onDragLeave={() => setDragOver(false)}
+                onDrop={handleDrop}
+                className={`flex flex-col items-center justify-center gap-2 px-4 py-6 rounded-md border border-dashed transition-colors cursor-pointer ${
+                  dragOver
+                    ? 'border-blue-500 bg-blue-950/20 text-blue-300'
+                    : 'border-zinc-700/80 bg-[#0B0D11] text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+                }`}
+              >
+                <Upload className="w-5 h-5" />
+                <span className="text-xs font-medium">
+                  Drop reference image or video, or click to browse
+                </span>
+                <span className="text-[11px] text-zinc-500">
+                  PNG, JPG, WEBP, MP4, WEBM supported
+                </span>
+                <input
+                  id={`field-${field.id}`}
+                  type="file"
+                  accept="image/*,video/*"
+                  className="sr-only"
+                  onChange={(e) => {
+                    const selected = e.target.files?.[0] || null;
+                    onFileChange(selected);
+                  }}
+                />
+              </label>
+            </>
           )}
         </div>
       )}

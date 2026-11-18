@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import secrets
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from sqlmodel import Session
 from app.config import settings
 from app.database import engine
 from app.models import GenerationRecord
-from app.schemas import OutputFileInfo
+from app.schemas import InputMediaInfo, OutputFileInfo
 
 
 class SSEHub:
@@ -55,6 +56,48 @@ def detect_media_type(filename: str, fmt: str = "") -> str:
     ):
         return "video"
     return "image"
+
+
+def safe_dir_segment(value: str, fallback: str = "uncategorized") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "-", str(value or "").strip())
+    cleaned = re.sub(r"-+", "-", cleaned).strip(".-")
+    return cleaned or fallback
+
+
+def resolve_safe_outputs_path(rel_path: str) -> Path | None:
+    cleaned = str(rel_path or "").lstrip("/\\")
+    if not cleaned:
+        return None
+    outputs_root = settings.outputs_path.resolve()
+    resolved = (outputs_root / cleaned).resolve()
+    try:
+        resolved.relative_to(outputs_root)
+    except ValueError:
+        return None
+    if resolved == outputs_root:
+        return None
+    return resolved
+
+
+def guess_mime_type(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    if lower.endswith(".mp4"):
+        return "video/mp4"
+    if lower.endswith(".webm"):
+        return "video/webm"
+    if lower.endswith(".mov"):
+        return "video/quicktime"
+    if lower.endswith(".mkv"):
+        return "video/x-matroska"
+    return "application/octet-stream"
 
 
 async def check_comfy_health(comfyui_url: str) -> dict[str, Any]:
@@ -104,6 +147,7 @@ async def download_comfy_outputs(
     comfyui_url: str,
     prompt_id: str,
     preferred_output_node_ids: list[str] | None = None,
+    category_name: str = "uncategorized",
 ) -> list[OutputFileInfo]:
     url = comfyui_url.rstrip("/")
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -128,6 +172,12 @@ async def download_comfy_outputs(
             else []
         )
         entries_to_download = matching_preferred if matching_preferred else all_items
+
+        cat_dir = safe_dir_segment(category_name, "uncategorized")
+        prompt_dir_seg = safe_dir_segment(prompt_id, "unknown")
+        target_dir = settings.outputs_path / cat_dir / prompt_dir_seg
+        target_dir.mkdir(parents=True, exist_ok=True)
+
         saved_outputs: list[OutputFileInfo] = []
 
         for node_id, node_output in entries_to_download:
@@ -156,16 +206,17 @@ async def download_comfy_outputs(
 
                 ext = Path(orig_name).suffix or ".png"
                 local_name = f"{int(time.time() * 1000)}_{secrets.token_hex(4)}{ext}"
-                local_path = settings.outputs_path / local_name
+                local_path = target_dir / local_name
                 local_path.write_bytes(view_resp.content)
 
+                rel_filename = f"{cat_dir}/{prompt_dir_seg}/{local_name}"
                 fmt = str(item.get("format") or ext.lstrip("."))
                 media_type = detect_media_type(orig_name, fmt)
                 saved_outputs.append(
                     OutputFileInfo(
-                        filename=local_name,
+                        filename=rel_filename,
                         original_filename=orig_name,
-                        url=f"/outputs/{local_name}",
+                        url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/{quote(local_name, safe='')}",
                         media_type="video" if media_type == "video" else "image",
                         format=fmt,
                         node_id=str(node_id),
@@ -185,6 +236,7 @@ async def queue_and_track_generation(
     submitted_inputs: dict[str, Any],
     client_id: str,
     output_node_ids: list[str] | None = None,
+    pending_input_media: list[dict[str, Any]] | None = None,
 ) -> str:
     ws_url = to_ws_url(comfyui_url, client_id)
     base_url = comfyui_url.rstrip("/")
@@ -205,6 +257,34 @@ async def queue_and_track_generation(
         await ws_conn.close()
         raise
 
+    cat_dir = safe_dir_segment(category_name, "uncategorized")
+    prompt_dir_seg = safe_dir_segment(prompt_id, "unknown")
+    saved_input_media: list[InputMediaInfo] = []
+    if pending_input_media:
+        inputs_dir = settings.outputs_path / cat_dir / prompt_dir_seg / "inputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        for item in pending_input_media:
+            orig_name = str(item.get("original_filename") or "input.png")
+            media_type = "video" if item.get("media_type") == "video" else "image"
+            ext = Path(orig_name).suffix or (".mp4" if media_type == "video" else ".png")
+            field_slug = safe_dir_segment(str(item.get("field_name") or "input"), "input")
+            local_name = f"{field_slug}_{int(time.time() * 1000)}_{secrets.token_hex(3)}{ext}"
+            local_path = inputs_dir / local_name
+            local_path.write_bytes(item["content"])
+            saved_input_media.append(
+                InputMediaInfo(
+                    key=str(item["key"]),
+                    node_id=str(item["node_id"]),
+                    field_name=str(item["field_name"]),
+                    label=item.get("label"),
+                    filename=f"{cat_dir}/{prompt_dir_seg}/inputs/{local_name}",
+                    original_filename=orig_name,
+                    comfy_name=str(item["comfy_name"]),
+                    url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/inputs/{quote(local_name, safe='')}",
+                    media_type=media_type,
+                )
+            )
+
     started_at = time.monotonic()
     asyncio.create_task(
         _watch_ws_until_done(
@@ -220,6 +300,7 @@ async def queue_and_track_generation(
             submitted_inputs=submitted_inputs,
             started_at=started_at,
             output_node_ids=output_node_ids,
+            input_media=saved_input_media,
         )
     )
     return prompt_id
@@ -238,6 +319,7 @@ async def _watch_ws_until_done(
     submitted_inputs: dict[str, Any],
     started_at: float,
     output_node_ids: list[str] | None = None,
+    input_media: list[InputMediaInfo] | None = None,
 ) -> None:
     await sse_hub.emit(
         client_id,
@@ -314,11 +396,14 @@ async def _watch_ws_until_done(
                 )
                 return
 
-        outputs = await download_comfy_outputs(comfyui_url, prompt_id, output_node_ids)
+        outputs = await download_comfy_outputs(
+            comfyui_url, prompt_id, output_node_ids, category_name
+        )
         duration_ms = int((time.monotonic() - started_at) * 1000)
         has_video = any(o.media_type == "video" for o in outputs)
         primary_media_type = "video" if (output_type == "video" or has_video) else "image"
         primary_url = outputs[0].url if outputs else ""
+        input_media_list = [m.model_dump() for m in (input_media or [])]
 
         with Session(engine) as session:
             record = GenerationRecord(
@@ -331,6 +416,7 @@ async def _watch_ws_until_done(
                 media_type=primary_media_type,
                 primary_output_url=primary_url,
                 outputs_json=json.dumps([o.model_dump() for o in outputs]),
+                input_media_json=json.dumps(input_media_list),
                 submitted_inputs_json=json.dumps(submitted_inputs),
                 duration_ms=duration_ms,
             )
@@ -349,6 +435,7 @@ async def _watch_ws_until_done(
                 "media_type": record.media_type,
                 "primary_output_url": record.primary_output_url,
                 "outputs": [o.model_dump() for o in outputs],
+                "input_media": input_media_list,
                 "submitted_inputs": submitted_inputs,
                 "duration_ms": record.duration_ms,
                 "error_message": record.error_message,

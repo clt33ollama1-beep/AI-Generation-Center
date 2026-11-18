@@ -33,7 +33,7 @@ export default function App() {
   const [workflows, setWorkflows] = useState<WorkflowTemplate[]>([]);
   const [generations, setGenerations] = useState<GenerationRecord[]>([]);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(getInitialWorkflowId);
-  const [prefilledInputs, setPrefilledInputs] = useState<Record<string, unknown> | null>(null);
+  const [prefilledGeneration, setPrefilledGeneration] = useState<GenerationRecord | null>(null);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [createTemplateTrigger, setCreateTemplateTrigger] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -89,7 +89,7 @@ export default function App() {
 
   const handleReuseInWorkspace = (gen: GenerationRecord) => {
     setSelectedWorkflowId(gen.workflow_id);
-    setPrefilledInputs(gen.submitted_inputs);
+    setPrefilledGeneration(gen);
     navigate('/');
   };
 
@@ -113,12 +113,12 @@ export default function App() {
               categories={categories}
               workflows={workflows}
               selectedWorkflowId={selectedWorkflowId}
-              prefilledInputs={prefilledInputs}
+              prefilledGeneration={prefilledGeneration}
               onSelectWorkflow={(id) => {
-                setPrefilledInputs(null);
+                setPrefilledGeneration(null);
                 setSelectedWorkflowId(id);
               }}
-              onClearPrefilled={() => setPrefilledInputs(null)}
+              onClearPrefilled={() => setPrefilledGeneration(null)}
               onOpenConnection={() => setConnectionOpen(true)}
               onGenerationComplete={(gen) => {
                 setGenerations((prev) => [gen, ...prev]);
@@ -134,7 +134,7 @@ export default function App() {
               createModeTrigger={createTemplateTrigger}
               onRefreshData={refreshAll}
               onOpenInWorkspace={(wfId) => {
-                setPrefilledInputs(null);
+                setPrefilledGeneration(null);
                 setSelectedWorkflowId(wfId);
                 navigate('/');
               }}
@@ -143,6 +143,7 @@ export default function App() {
 
           {route === '/gallery' && (
             <GalleryView
+              categories={categories}
               generations={generations}
               workflows={workflows}
               onDeleted={(id) => {

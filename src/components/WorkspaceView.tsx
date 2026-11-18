@@ -16,6 +16,7 @@ import { api } from '../lib/api.ts';
 import type {
   Category,
   GenerationRecord,
+  InputMediaInfo,
   OutputFileInfo,
   ProgressEventPayload,
   WorkflowTemplate,
@@ -26,7 +27,7 @@ interface WorkspaceViewProps {
   categories: Category[];
   workflows: WorkflowTemplate[];
   selectedWorkflowId: number | null;
-  prefilledInputs?: Record<string, unknown> | null;
+  prefilledGeneration?: GenerationRecord | null;
   onSelectWorkflow: (id: number) => void;
   onClearPrefilled?: () => void;
   onOpenConnection: () => void;
@@ -39,6 +40,7 @@ const DRAFT_STORAGE_PREFIX = 'comfycentre:draft:';
 interface StoredWorkflowDraft {
   values?: Record<string, string | number | boolean>;
   seedLocks?: Record<string, boolean>;
+  reusedMedia?: Record<string, InputMediaInfo>;
 }
 
 function loadWorkflowDraft(workflowId: number): StoredWorkflowDraft | null {
@@ -89,7 +91,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   categories,
   workflows,
   selectedWorkflowId,
-  prefilledInputs,
+  prefilledGeneration,
   onSelectWorkflow,
   onClearPrefilled,
   onOpenConnection,
@@ -100,6 +102,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [collapsedCats, setCollapsedCats] = useState<Record<number, boolean>>({});
   const [formValues, setFormValues] = useState<Record<string, string | number | boolean>>({});
   const [fileValues, setFileValues] = useState<Record<string, File | null>>({});
+  const [reusedMedia, setReusedMedia] = useState<Record<string, InputMediaInfo>>({});
   const [seedLocks, setSeedLocks] = useState<Record<string, boolean>>({});
 
   const [isRunning, setIsRunning] = useState(false);
@@ -120,37 +123,80 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     return workflows.find((w) => w.id === selectedWorkflowId) || workflows[0];
   }, [workflows, selectedWorkflowId]);
 
-  // Initialize form values when active workflow or prefilledInputs changes,
+  // Initialize form values when active workflow or prefilledGeneration changes,
   // restoring any saved localStorage draft for the workflow.
   useEffect(() => {
     if (!activeWorkflow) return;
+    const isApplyingPrefill =
+      Boolean(prefilledGeneration) && prefilledGeneration!.workflow_id === activeWorkflow.id;
     const draft = loadWorkflowDraft(activeWorkflow.id);
     const initialValues: Record<string, string | number | boolean> = {};
+    const nextReusedMedia: Record<string, InputMediaInfo> = {};
+    const nextSeedLocks: Record<string, boolean> =
+      !isApplyingPrefill && draft?.seedLocks ? { ...draft.seedLocks } : {};
+
+    const prefilledInputs = isApplyingPrefill ? prefilledGeneration!.submitted_inputs || {} : null;
+    const prefilledInputMedia = isApplyingPrefill ? prefilledGeneration!.input_media || [] : [];
 
     for (const field of activeWorkflow.ui_inputs) {
       const key = `${field.node_id}:${field.field_name}`;
-      if (prefilledInputs && key in prefilledInputs && field.value_type !== 'media') {
-        initialValues[key] = prefilledInputs[key] as string | number | boolean;
-      } else if (draft?.values && key in draft.values && field.value_type !== 'media') {
-        initialValues[key] = draft.values[key];
+      if (isApplyingPrefill && prefilledInputs) {
+        const hasVal = key in prefilledInputs || field.id in prefilledInputs;
+        if (field.value_type === 'media') {
+          const matchedMedia = prefilledInputMedia.find(
+            (m) => m.key === key || (m.node_id === field.node_id && m.field_name === field.field_name),
+          );
+          if (matchedMedia) {
+            nextReusedMedia[key] = matchedMedia;
+            initialValues[key] = matchedMedia.comfy_name || '';
+          } else if (hasVal) {
+            const raw = (key in prefilledInputs ? prefilledInputs[key] : prefilledInputs[field.id]) ?? '';
+            initialValues[key] = String(raw);
+          } else {
+            initialValues[key] = field.default_value;
+          }
+        } else if (hasVal) {
+          initialValues[key] = (
+            key in prefilledInputs ? prefilledInputs[key] : prefilledInputs[field.id]
+          ) as string | number | boolean;
+          if (field.widget === 'seed_randomizer') {
+            nextSeedLocks[key] = true;
+          }
+        } else {
+          initialValues[key] = field.default_value;
+        }
       } else {
-        initialValues[key] = field.default_value;
+        if (field.value_type === 'media') {
+          if (draft?.reusedMedia && draft.reusedMedia[key]) {
+            nextReusedMedia[key] = draft.reusedMedia[key];
+          }
+          if (draft?.values && key in draft.values) {
+            initialValues[key] = draft.values[key];
+          } else {
+            initialValues[key] = field.default_value;
+          }
+        } else if (draft?.values && key in draft.values) {
+          initialValues[key] = draft.values[key];
+        } else {
+          initialValues[key] = field.default_value;
+        }
       }
     }
 
-    const nextSeedLocks = draft?.seedLocks ? { ...draft.seedLocks } : {};
     setFormValues(initialValues);
     setSeedLocks(nextSeedLocks);
+    setReusedMedia(nextReusedMedia);
     setFileValues({});
     setRunError(null);
 
-    if (prefilledInputs) {
+    if (isApplyingPrefill) {
       saveWorkflowDraft(activeWorkflow.id, {
         values: initialValues,
         seedLocks: nextSeedLocks,
+        reusedMedia: nextReusedMedia,
       });
     }
-  }, [activeWorkflow, prefilledInputs]);
+  }, [activeWorkflow, prefilledGeneration]);
 
   useEffect(() => {
     return () => {
@@ -187,6 +233,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     onClearPrefilled?.();
     setFormValues(defaults);
     setSeedLocks({});
+    setReusedMedia({});
     setFileValues({});
     setRunError(null);
   };
@@ -213,7 +260,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
         }
       }
       setFormValues(nextValues);
-      saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks });
+      saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks, reusedMedia });
 
       const clientId = generateClientId();
 
@@ -264,12 +311,18 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
       formData.append('client_id', clientId);
       formData.append('inputs_json', JSON.stringify(nextValues));
 
+      const reusedMediaPayload: Record<string, InputMediaInfo> = {};
       for (const field of activeWorkflow.ui_inputs) {
         const key = `${field.node_id}:${field.field_name}`;
         const file = fileValues[key];
         if (file) {
           formData.append(`file:${field.node_id}:${field.field_name}`, file);
+        } else if (reusedMedia[key]) {
+          reusedMediaPayload[key] = reusedMedia[key];
         }
+      }
+      if (Object.keys(reusedMediaPayload).length > 0) {
+        formData.append('reused_media_json', JSON.stringify(reusedMediaPayload));
       }
 
       await api.submitGeneration(formData);
@@ -434,6 +487,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                       field={field}
                       value={formValues[key] ?? field.default_value}
                       fileValue={fileValues[key] ?? null}
+                      reusedMedia={reusedMedia[key] ?? null}
                       seedLocked={Boolean(seedLocks[key])}
                       onToggleSeedLock={
                         field.widget === 'seed_randomizer'
@@ -446,6 +500,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                                 saveWorkflowDraft(activeWorkflow.id, {
                                   values: formValues,
                                   seedLocks: next,
+                                  reusedMedia,
                                 });
                                 return next;
                               })
@@ -460,16 +515,44 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                           saveWorkflowDraft(activeWorkflow.id, {
                             values: next,
                             seedLocks,
+                            reusedMedia,
                           });
                           return next;
                         })
                       }
-                      onFileChange={(file) =>
+                      onFileChange={(file) => {
                         setFileValues((prev) => ({
                           ...prev,
                           [key]: file,
-                        }))
-                      }
+                        }));
+                        if (file && reusedMedia[key]) {
+                          setReusedMedia((prev) => {
+                            const next = { ...prev };
+                            delete next[key];
+                            saveWorkflowDraft(activeWorkflow.id, {
+                              values: formValues,
+                              seedLocks,
+                              reusedMedia: next,
+                            });
+                            return next;
+                          });
+                        }
+                      }}
+                      onClearReusedMedia={() => {
+                        const nextReused = { ...reusedMedia };
+                        delete nextReused[key];
+                        const nextValues = {
+                          ...formValues,
+                          [key]: '',
+                        };
+                        setReusedMedia(nextReused);
+                        setFormValues(nextValues);
+                        saveWorkflowDraft(activeWorkflow.id, {
+                          values: nextValues,
+                          seedLocks,
+                          reusedMedia: nextReused,
+                        });
+                      }}
                     />
                   );
                 })}

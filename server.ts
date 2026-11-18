@@ -14,6 +14,7 @@ import { SEED_CATEGORIES, SEED_WORKFLOWS } from './server/seedData.ts';
 import type {
   ComfyApiWorkflow,
   GenerationRecord,
+  InputMediaInfo,
   InspectedInput,
   InspectedNode,
   OutputFileInfo,
@@ -84,12 +85,54 @@ if (!workflowCols.some((c) => c.name === 'output_node_ids_json')) {
   db.exec("ALTER TABLE workflows ADD COLUMN output_node_ids_json TEXT NOT NULL DEFAULT '[]';");
 }
 
+const generationCols = db.prepare('PRAGMA table_info(generations)').all() as Array<{ name: string }>;
+if (!generationCols.some((c) => c.name === 'input_media_json')) {
+  db.exec("ALTER TABLE generations ADD COLUMN input_media_json TEXT NOT NULL DEFAULT '[]';");
+}
+
 function slugify(value: string): string {
   return value
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'category';
+}
+
+function safeDirSegment(value: string, fallback = 'uncategorized'): string {
+  const cleaned = String(value || '')
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f\s]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '');
+  return cleaned || fallback;
+}
+
+function resolveSafeOutputsPath(relPath: string): string | null {
+  const cleaned = String(relPath || '').replace(/^[/\\]+/, '');
+  if (!cleaned) return null;
+  const outputsRoot = path.resolve(OUTPUTS_DIR);
+  const resolved = path.resolve(outputsRoot, cleaned);
+  if (!resolved.startsWith(`${outputsRoot}${path.sep}`)) {
+    return null;
+  }
+  return resolved;
+}
+
+function buildOutputUrl(...segments: string[]): string {
+  return `/outputs/${segments.map((seg) => encodeURIComponent(seg)).join('/')}`;
+}
+
+function guessMimeType(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.webm')) return 'video/webm';
+  if (lower.endsWith('.mov')) return 'video/quicktime';
+  if (lower.endsWith('.mkv')) return 'video/x-matroska';
+  return 'application/octet-stream';
 }
 
 function seedDatabaseIfEmpty(): void {
@@ -279,6 +322,15 @@ function mapWorkflowRow(row: Record<string, unknown>) {
 }
 
 function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
+  let inputMedia: InputMediaInfo[] = [];
+  try {
+    const parsed = JSON.parse(String(row.input_media_json || '[]'));
+    if (Array.isArray(parsed)) {
+      inputMedia = parsed as InputMediaInfo[];
+    }
+  } catch {
+    inputMedia = [];
+  }
   return {
     id: Number(row.id),
     workflow_id: Number(row.workflow_id),
@@ -290,6 +342,7 @@ function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
     media_type: String(row.media_type) as GenerationRecord['media_type'],
     primary_output_url: String(row.primary_output_url),
     outputs: JSON.parse(String(row.outputs_json)) as OutputFileInfo[],
+    input_media: inputMedia,
     submitted_inputs: JSON.parse(String(row.submitted_inputs_json)) as Record<string, unknown>,
     duration_ms: Number(row.duration_ms || 0),
     error_message: row.error_message ? String(row.error_message) : null,
@@ -337,13 +390,15 @@ function detectMediaTypeFromFilename(filename: string, format?: string): 'image'
 
 async function uploadMediaToComfyUI(
   comfyUrl: string,
-  file: Express.Multer.File,
+  buffer: Buffer,
+  originalname: string,
+  mimetype: string,
 ): Promise<string> {
   const form = new FormData();
-  const blob = new Blob([new Uint8Array(file.buffer)], {
-    type: file.mimetype || 'application/octet-stream',
+  const blob = new Blob([new Uint8Array(buffer)], {
+    type: mimetype || 'application/octet-stream',
   });
-  form.append('image', blob, file.originalname || 'upload.png');
+  form.append('image', blob, originalname || 'upload.png');
   form.append('overwrite', 'true');
 
   const response = await fetch(`${comfyUrl}/upload/image`, {
@@ -364,6 +419,7 @@ async function downloadComfyOutputs(
   comfyUrl: string,
   promptId: string,
   preferredOutputNodeIds: string[] = [],
+  categoryName = 'uncategorized',
 ): Promise<OutputFileInfo[]> {
   const historyRes = await fetch(`${comfyUrl}/history/${encodeURIComponent(promptId)}`);
   if (!historyRes.ok) {
@@ -402,6 +458,11 @@ async function downloadComfyOutputs(
       : [];
   const entriesToDownload = matchingPreferred.length > 0 ? matchingPreferred : allEntries;
 
+  const catDir = safeDirSegment(categoryName, 'uncategorized');
+  const promptDirSeg = safeDirSegment(promptId, 'unknown');
+  const targetDir = path.join(OUTPUTS_DIR, catDir, promptDirSeg);
+  fs.mkdirSync(targetDir, { recursive: true });
+
   const savedOutputs: OutputFileInfo[] = [];
 
   for (const [nodeId, nodeOutput] of entriesToDownload) {
@@ -427,14 +488,15 @@ async function downloadComfyOutputs(
       const arrayBuf = await viewRes.arrayBuffer();
       const ext = path.extname(item.filename) || '.png';
       const localName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
-      const localPath = path.join(OUTPUTS_DIR, localName);
+      const localPath = path.join(targetDir, localName);
       fs.writeFileSync(localPath, Buffer.from(arrayBuf));
 
+      const relFilename = `${catDir}/${promptDirSeg}/${localName}`;
       const mediaType = detectMediaTypeFromFilename(item.filename, item.format);
       savedOutputs.push({
-        filename: localName,
+        filename: relFilename,
         original_filename: item.filename,
-        url: `/outputs/${localName}`,
+        url: buildOutputUrl(catDir, promptDirSeg, localName),
         media_type: mediaType,
         format: item.format || ext.replace('.', ''),
         node_id: nodeId,
@@ -756,10 +818,35 @@ app.delete('/api/generations/:id', (req: Request, res: Response) => {
     return;
   }
   const gen = mapGenerationRow(row);
+  const candidateDirs = new Set<string>();
   for (const out of gen.outputs) {
-    const filePath = path.join(OUTPUTS_DIR, out.filename);
-    if (fs.existsSync(filePath)) {
+    const filePath = resolveSafeOutputsPath(out.filename);
+    if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
+      candidateDirs.add(path.dirname(filePath));
+    }
+  }
+  for (const inp of gen.input_media || []) {
+    const filePath = resolveSafeOutputsPath(inp.filename);
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      candidateDirs.add(path.dirname(filePath));
+    }
+  }
+  const outputsRoot = path.resolve(OUTPUTS_DIR);
+  for (const dir of candidateDirs) {
+    let curr = dir;
+    while (curr.startsWith(`${outputsRoot}${path.sep}`)) {
+      try {
+        if (fs.existsSync(curr) && fs.readdirSync(curr).length === 0) {
+          fs.rmdirSync(curr);
+          curr = path.dirname(curr);
+        } else {
+          break;
+        }
+      } catch {
+        break;
+      }
     }
   }
   db.prepare('DELETE FROM generations WHERE id = ?').run(id);
@@ -841,8 +928,27 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
     JSON.stringify(normalizedTemplate),
   );
 
-  // 1. Forward uploaded media files to ComfyUI /upload/image
+  // 1. Forward uploaded or reused media files to ComfyUI /upload/image
+  interface PendingInputMedia {
+    key: string;
+    node_id: string;
+    field_name: string;
+    label?: string;
+    original_filename: string;
+    comfy_name: string;
+    media_type: 'image' | 'video';
+    buffer: Buffer;
+  }
+
+  const fieldLabelByKey = new Map<string, string>();
+  for (const f of workflowTemplate.ui_inputs) {
+    fieldLabelByKey.set(`${f.node_id}:${f.field_name}`, f.label);
+  }
+
+  const pendingInputMedia: PendingInputMedia[] = [];
+  const handledMediaKeys = new Set<string>();
   const files = (req.files as Express.Multer.File[]) || [];
+
   try {
     for (const file of files) {
       // Field name format: "file:<node_id>:<field_name>"
@@ -850,10 +956,72 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       if (parts.length >= 3 && parts[0] === 'file') {
         const nodeId = parts[1];
         const fieldName = parts.slice(2).join(':');
-        const uploadedName = await uploadMediaToComfyUI(comfyUrl, file);
+        const mediaKey = `${nodeId}:${fieldName}`;
+        const origName = file.originalname || 'upload.png';
+        const uploadedName = await uploadMediaToComfyUI(
+          comfyUrl,
+          file.buffer,
+          origName,
+          file.mimetype || guessMimeType(origName),
+        );
         if (workflowCopy[nodeId]?.inputs) {
           workflowCopy[nodeId].inputs[fieldName] = uploadedName;
-          submittedInputs[`${nodeId}:${fieldName}`] = uploadedName;
+          submittedInputs[mediaKey] = uploadedName;
+        }
+        handledMediaKeys.add(mediaKey);
+        pendingInputMedia.push({
+          key: mediaKey,
+          node_id: nodeId,
+          field_name: fieldName,
+          label: fieldLabelByKey.get(mediaKey),
+          original_filename: origName,
+          comfy_name: uploadedName,
+          media_type: detectMediaTypeFromFilename(origName, file.mimetype),
+          buffer: file.buffer,
+        });
+      }
+    }
+
+    const rawReusedMedia = req.body?.reused_media_json ? String(req.body.reused_media_json) : '';
+    if (rawReusedMedia) {
+      const reusedMap = JSON.parse(rawReusedMedia) as Record<string, Partial<InputMediaInfo>>;
+      if (reusedMap && typeof reusedMap === 'object') {
+        for (const [mediaKey, info] of Object.entries(reusedMap)) {
+          if (handledMediaKeys.has(mediaKey) || !info || typeof info !== 'object') continue;
+          const parts = mediaKey.split(':');
+          if (parts.length < 2) continue;
+          const nodeId = String(info.node_id || parts[0]);
+          const fieldName = String(info.field_name || parts.slice(1).join(':'));
+          const safePath = info.filename ? resolveSafeOutputsPath(info.filename) : null;
+          if (safePath && fs.existsSync(safePath)) {
+            const buffer = fs.readFileSync(safePath);
+            const origName = info.original_filename || path.basename(safePath);
+            const mimeType = guessMimeType(origName);
+            const uploadedName = await uploadMediaToComfyUI(comfyUrl, buffer, origName, mimeType);
+            if (workflowCopy[nodeId]?.inputs) {
+              workflowCopy[nodeId].inputs[fieldName] = uploadedName;
+              submittedInputs[mediaKey] = uploadedName;
+            }
+            handledMediaKeys.add(mediaKey);
+            pendingInputMedia.push({
+              key: mediaKey,
+              node_id: nodeId,
+              field_name: fieldName,
+              label: info.label || fieldLabelByKey.get(mediaKey),
+              original_filename: origName,
+              comfy_name: uploadedName,
+              media_type:
+                info.media_type === 'video' || info.media_type === 'image'
+                  ? info.media_type
+                  : detectMediaTypeFromFilename(origName, mimeType),
+              buffer,
+            });
+          } else if (info.comfy_name) {
+            if (workflowCopy[nodeId]?.inputs) {
+              workflowCopy[nodeId].inputs[fieldName] = info.comfy_name;
+              submittedInputs[mediaKey] = info.comfy_name;
+            }
+          }
         }
       }
     }
@@ -937,6 +1105,33 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
     return;
   }
 
+  // Persist local copies of uploaded/reused input media under <category>/<prompt_id>/inputs/
+  const catDir = safeDirSegment(workflowTemplate.category_name, 'uncategorized');
+  const promptDirSeg = safeDirSegment(promptId, 'unknown');
+  const savedInputMedia: InputMediaInfo[] = [];
+  if (pendingInputMedia.length > 0) {
+    const inputsTargetDir = path.join(OUTPUTS_DIR, catDir, promptDirSeg, 'inputs');
+    fs.mkdirSync(inputsTargetDir, { recursive: true });
+    for (const item of pendingInputMedia) {
+      const ext = path.extname(item.original_filename) || (item.media_type === 'video' ? '.mp4' : '.png');
+      const baseSlug = safeDirSegment(item.field_name, 'input');
+      const localName = `${baseSlug}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}${ext}`;
+      const localPath = path.join(inputsTargetDir, localName);
+      fs.writeFileSync(localPath, item.buffer);
+      savedInputMedia.push({
+        key: item.key,
+        node_id: item.node_id,
+        field_name: item.field_name,
+        label: item.label,
+        filename: `${catDir}/${promptDirSeg}/inputs/${localName}`,
+        original_filename: item.original_filename,
+        comfy_name: item.comfy_name,
+        url: buildOutputUrl(catDir, promptDirSeg, 'inputs', localName),
+        media_type: item.media_type,
+      });
+    }
+  }
+
   // Return immediately with prompt_id; WebSocket watcher continues in background and streams SSE
   res.status(202).json({
     prompt_id: promptId,
@@ -966,6 +1161,7 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
         comfyUrl,
         promptId,
         workflowTemplate.output_node_ids,
+        workflowTemplate.category_name,
       );
       const durationMs = Date.now() - startedAt;
       const hasVideo = outputs.some((o) => o.media_type === 'video');
@@ -977,8 +1173,8 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
         .prepare(`
           INSERT INTO generations (
             workflow_id, workflow_name, category_name, prompt_id, client_id,
-            status, media_type, primary_output_url, outputs_json, submitted_inputs_json, duration_ms
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, media_type, primary_output_url, outputs_json, input_media_json, submitted_inputs_json, duration_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           workflowTemplate.id,
@@ -990,6 +1186,7 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
           primaryMediaType,
           primaryUrl,
           JSON.stringify(outputs),
+          JSON.stringify(savedInputMedia),
           JSON.stringify(submittedInputs),
           durationMs,
         );

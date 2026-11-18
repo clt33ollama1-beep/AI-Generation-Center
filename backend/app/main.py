@@ -13,9 +13,13 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 from starlette.datastructures import UploadFile
 
+from pathlib import Path
 from app.comfy_client import (
     check_comfy_health,
+    detect_media_type,
+    guess_mime_type,
     queue_and_track_generation,
+    resolve_safe_outputs_path,
     sse_hub,
     upload_media_to_comfyui,
 )
@@ -35,6 +39,7 @@ from app.schemas import (
     CategoryRead,
     CategoryUpdate,
     GenerationRead,
+    InputMediaInfo,
     OutputFileInfo,
     SettingsPayload,
     UIInputField,
@@ -100,6 +105,10 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
 
 def to_generation_read(rec: GenerationRecord) -> GenerationRead:
     outputs_raw = json.loads(rec.outputs_json or "[]")
+    try:
+        input_media_raw = json.loads(getattr(rec, "input_media_json", "[]") or "[]")
+    except Exception:
+        input_media_raw = []
     return GenerationRead(
         id=rec.id or 0,
         workflow_id=rec.workflow_id,
@@ -111,6 +120,7 @@ def to_generation_read(rec: GenerationRecord) -> GenerationRead:
         media_type=rec.media_type,  # type: ignore[arg-type]
         primary_output_url=rec.primary_output_url,
         outputs=[OutputFileInfo(**o) for o in outputs_raw],
+        input_media=[InputMediaInfo(**m) for m in input_media_raw if isinstance(m, dict)],
         submitted_inputs=json.loads(rec.submitted_inputs_json or "{}"),
         duration_ms=rec.duration_ms,
         error_message=rec.error_message,
@@ -357,12 +367,39 @@ def delete_generation(generation_id: int, session: Session = Depends(get_session
     rec = session.get(GenerationRecord, generation_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Generation not found")
+    candidate_dirs: set[Path] = set()
     for out in json.loads(rec.outputs_json or "[]"):
-        filename = out.get("filename")
+        filename = out.get("filename") if isinstance(out, dict) else None
         if filename:
-            target = settings.outputs_path / filename
-            if target.exists():
+            target = resolve_safe_outputs_path(str(filename))
+            if target and target.exists():
                 target.unlink()
+                candidate_dirs.add(target.parent)
+    for inp in json.loads(getattr(rec, "input_media_json", "[]") or "[]"):
+        filename = inp.get("filename") if isinstance(inp, dict) else None
+        if filename:
+            target = resolve_safe_outputs_path(str(filename))
+            if target and target.exists():
+                target.unlink()
+                candidate_dirs.add(target.parent)
+
+    outputs_root = settings.outputs_path.resolve()
+    for d in candidate_dirs:
+        curr = d
+        while curr != outputs_root:
+            try:
+                curr.relative_to(outputs_root)
+            except ValueError:
+                break
+            try:
+                if curr.exists() and not any(curr.iterdir()):
+                    curr.rmdir()
+                    curr = curr.parent
+                else:
+                    break
+            except OSError:
+                break
+
     session.delete(rec)
     session.commit()
     return {"deleted": True}
@@ -435,19 +472,26 @@ async def generate_output(
     )
     ui_inputs = [UIInputField(**item) for item in json.loads(wf.ui_inputs_json)]
 
-    # 1. Forward uploaded media files to ComfyUI /upload/image
+    # 1. Forward uploaded or reused media files to ComfyUI /upload/image
+    field_label_by_key = {f"{f.node_id}:{f.field_name}": f.label for f in ui_inputs}
+    pending_input_media: list[dict[str, Any]] = []
+    handled_media_keys: set[str] = set()
+
     for field_key, form_val in form.multi_items():
         if isinstance(form_val, UploadFile) and field_key.startswith("file:"):
             parts = field_key.split(":", 2)
             if len(parts) == 3:
                 _, node_id, field_name = parts
+                media_key = f"{node_id}:{field_name}"
                 file_bytes = await form_val.read()
+                orig_name = form_val.filename or "upload.png"
+                content_type = form_val.content_type or guess_mime_type(orig_name)
                 try:
                     uploaded_name = await upload_media_to_comfyui(
                         comfy_url,
-                        form_val.filename or "upload.png",
+                        orig_name,
                         file_bytes,
-                        form_val.content_type or "application/octet-stream",
+                        content_type,
                     )
                 except Exception as exc:
                     await sse_hub.emit(
@@ -458,7 +502,86 @@ async def generate_output(
 
                 if node_id in workflow_copy and isinstance(workflow_copy[node_id].get("inputs"), dict):
                     workflow_copy[node_id]["inputs"][field_name] = uploaded_name
-                    submitted_inputs[f"{node_id}:{field_name}"] = uploaded_name
+                    submitted_inputs[media_key] = uploaded_name
+
+                handled_media_keys.add(media_key)
+                pending_input_media.append(
+                    {
+                        "key": media_key,
+                        "node_id": node_id,
+                        "field_name": field_name,
+                        "label": field_label_by_key.get(media_key),
+                        "original_filename": orig_name,
+                        "comfy_name": uploaded_name,
+                        "media_type": detect_media_type(orig_name, content_type),
+                        "content": file_bytes,
+                    }
+                )
+
+    raw_reused_media = str(form.get("reused_media_json") or "").strip()
+    if raw_reused_media:
+        try:
+            reused_map = json.loads(raw_reused_media)
+        except json.JSONDecodeError:
+            reused_map = {}
+        if isinstance(reused_map, dict):
+            for media_key, info in reused_map.items():
+                if media_key in handled_media_keys or not isinstance(info, dict):
+                    continue
+                parts = str(media_key).split(":", 1)
+                if len(parts) < 2:
+                    continue
+                node_id = str(info.get("node_id") or parts[0])
+                field_name = str(info.get("field_name") or parts[1])
+                safe_path = (
+                    resolve_safe_outputs_path(str(info.get("filename")))
+                    if info.get("filename")
+                    else None
+                )
+                if safe_path and safe_path.exists():
+                    file_bytes = safe_path.read_bytes()
+                    orig_name = str(info.get("original_filename") or safe_path.name)
+                    content_type = guess_mime_type(orig_name)
+                    try:
+                        uploaded_name = await upload_media_to_comfyui(
+                            comfy_url,
+                            orig_name,
+                            file_bytes,
+                            content_type,
+                        )
+                    except Exception as exc:
+                        await sse_hub.emit(
+                            client_id,
+                            {"type": "error", "client_id": client_id, "message": str(exc)},
+                        )
+                        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+                    if node_id in workflow_copy and isinstance(workflow_copy[node_id].get("inputs"), dict):
+                        workflow_copy[node_id]["inputs"][field_name] = uploaded_name
+                        submitted_inputs[media_key] = uploaded_name
+
+                    handled_media_keys.add(media_key)
+                    media_type = (
+                        info.get("media_type")
+                        if info.get("media_type") in ("image", "video")
+                        else detect_media_type(orig_name, content_type)
+                    )
+                    pending_input_media.append(
+                        {
+                            "key": str(media_key),
+                            "node_id": node_id,
+                            "field_name": field_name,
+                            "label": info.get("label") or field_label_by_key.get(str(media_key)),
+                            "original_filename": orig_name,
+                            "comfy_name": uploaded_name,
+                            "media_type": media_type,
+                            "content": file_bytes,
+                        }
+                    )
+                elif info.get("comfy_name"):
+                    if node_id in workflow_copy and isinstance(workflow_copy[node_id].get("inputs"), dict):
+                        workflow_copy[node_id]["inputs"][field_name] = str(info["comfy_name"])
+                        submitted_inputs[media_key] = str(info["comfy_name"])
 
     # 2. Inject primitive form values into deep-copied workflow
     for field in ui_inputs:
@@ -499,6 +622,7 @@ async def generate_output(
             submitted_inputs=submitted_inputs,
             client_id=client_id,
             output_node_ids=wf_output_node_ids,
+            pending_input_media=pending_input_media,
         )
     except Exception as exc:
         await sse_hub.emit(

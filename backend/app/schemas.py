@@ -156,6 +156,18 @@ class OutputFileInfo(BaseModel):
     node_id: str
 
 
+class InputMediaInfo(BaseModel):
+    key: str
+    node_id: str
+    field_name: str
+    label: Optional[str] = None
+    filename: str
+    original_filename: str
+    comfy_name: str
+    url: str
+    media_type: Literal["image", "video"]
+
+
 class GenerationRead(BaseModel):
     id: int
     workflow_id: int
@@ -167,6 +179,7 @@ class GenerationRead(BaseModel):
     media_type: Literal["image", "video"]
     primary_output_url: str
     outputs: list[OutputFileInfo]
+    input_media: list[InputMediaInfo] = Field(default_factory=list)
     submitted_inputs: dict[str, Any]
     duration_ms: int
     error_message: Optional[str] = None

@@ -53,6 +53,7 @@ class GenerationRecord(SQLModel, table=True):
     media_type: str = Field(default="image")
     primary_output_url: str = Field(default="")
     outputs_json: str = Field(default="[]")
+    input_media_json: str = Field(default="[]")
     submitted_inputs_json: str = Field(default="{}")
     duration_ms: int = Field(default=0)
     error_message: Optional[str] = Field(default=None)

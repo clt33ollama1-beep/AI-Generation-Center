@@ -119,6 +119,18 @@ export interface OutputFileInfo {
   node_id: string;
 }
 
+export interface InputMediaInfo {
+  key: string;
+  node_id: string;
+  field_name: string;
+  label?: string;
+  filename: string;
+  original_filename: string;
+  comfy_name: string;
+  url: string;
+  media_type: 'image' | 'video';
+}
+
 export interface GenerationRecord {
   id: number;
   workflow_id: number;
@@ -130,6 +142,7 @@ export interface GenerationRecord {
   media_type: 'image' | 'video';
   primary_output_url: string;
   outputs: OutputFileInfo[];
+  input_media?: InputMediaInfo[];
   submitted_inputs: Record<string, unknown>;
   duration_ms: number;
   error_message?: string | null;
