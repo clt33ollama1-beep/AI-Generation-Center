@@ -1,24 +1,31 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Download,
   Film,
   Image as ImageIcon,
+  ListPlus,
   Loader2,
+  Pause,
   Play,
   RotateCcw,
   Search,
   Sparkles,
+  Square,
+  X,
+  XCircle,
 } from 'lucide-react';
-import { api } from '../lib/api.ts';
 import type {
   Category,
   GenerationRecord,
   InputMediaInfo,
   OutputFileInfo,
-  ProgressEventPayload,
+  QueueTask,
   WorkflowTemplate,
 } from '../types/comfy.ts';
 import { DynamicField } from './DynamicField.tsx';
@@ -31,8 +38,27 @@ interface WorkspaceViewProps {
   onSelectWorkflow: (id: number) => void;
   onClearPrefilled?: () => void;
   onOpenConnection: () => void;
-  onGenerationComplete: (generation: GenerationRecord) => void;
   onGoTemplates: () => void;
+  queueTasks: QueueTask[];
+  isQueueRunning: boolean;
+  selectedOutputTaskId: string | null;
+  onSelectOutputTask: (taskId: string | null) => void;
+  onEnqueueTask: (args: {
+    workflow: WorkflowTemplate;
+    values: Record<string, string | number | boolean>;
+    fileValues: Record<string, File | null>;
+    reusedMedia: Record<string, InputMediaInfo>;
+    startNow: boolean;
+  }) => string;
+  onStartQueue: () => void;
+  onPauseQueue: () => void;
+  onRunTaskNow: (taskId: string) => void;
+  onMoveTaskUp: (taskId: string) => void;
+  onCancelTask: (taskId: string) => void;
+  onRetryTask: (taskId: string) => void;
+  onRequeueTask: (taskId: string) => void;
+  onRemoveTask: (taskId: string) => void;
+  onClearFinishedTasks: () => void;
 }
 
 const DRAFT_STORAGE_PREFIX = 'comfycentre:draft:';
@@ -70,23 +96,6 @@ function clearWorkflowDraft(workflowId: number): void {
   }
 }
 
-function generateClientId(): string {
-  if (typeof window !== 'undefined' && window.crypto) {
-    if (typeof window.crypto.randomUUID === 'function') {
-      return window.crypto.randomUUID();
-    }
-    if (typeof window.crypto.getRandomValues === 'function') {
-      const bytes = new Uint8Array(16);
-      window.crypto.getRandomValues(bytes);
-      bytes[6] = (bytes[6] & 0x0f) | 0x40;
-      bytes[8] = (bytes[8] & 0x3f) | 0x80;
-      const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-    }
-  }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   categories,
   workflows,
@@ -95,8 +104,21 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   onSelectWorkflow,
   onClearPrefilled,
   onOpenConnection,
-  onGenerationComplete,
   onGoTemplates,
+  queueTasks,
+  isQueueRunning,
+  selectedOutputTaskId,
+  onSelectOutputTask,
+  onEnqueueTask,
+  onStartQueue,
+  onPauseQueue,
+  onRunTaskNow,
+  onMoveTaskUp,
+  onCancelTask,
+  onRetryTask,
+  onRequeueTask,
+  onRemoveTask,
+  onClearFinishedTasks,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [collapsedCats, setCollapsedCats] = useState<Record<number, boolean>>({});
@@ -104,19 +126,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [fileValues, setFileValues] = useState<Record<string, File | null>>({});
   const [reusedMedia, setReusedMedia] = useState<Record<string, InputMediaInfo>>({});
   const [seedLocks, setSeedLocks] = useState<Record<string, boolean>>({});
-
-  const [isRunning, setIsRunning] = useState(false);
-  const [progressPercent, setProgressPercent] = useState(0);
-  const [stepProgress, setStepProgress] = useState<{ value: number; max: number } | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string>('Ready');
-  const [activeNodeLabel, setActiveNodeLabel] = useState<string | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [runError, setRunError] = useState<string | null>(null);
-  const [latestGeneration, setLatestGeneration] = useState<GenerationRecord | null>(null);
   const [selectedOutputIndex, setSelectedOutputIndex] = useState(0);
-
-  const unsubscribeSseRef = useRef<(() => void) | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const [queuedFeedback, setQueuedFeedback] = useState<string | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
 
   const activeWorkflow = useMemo(() => {
     if (workflows.length === 0) return null;
@@ -187,7 +199,6 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     setSeedLocks(nextSeedLocks);
     setReusedMedia(nextReusedMedia);
     setFileValues({});
-    setRunError(null);
 
     if (isApplyingPrefill) {
       saveWorkflowDraft(activeWorkflow.id, {
@@ -200,8 +211,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   useEffect(() => {
     return () => {
-      unsubscribeSseRef.current?.();
-      if (timerRef.current) window.clearInterval(timerRef.current);
+      if (feedbackTimerRef.current) window.clearTimeout(feedbackTimerRef.current);
     };
   }, []);
 
@@ -235,110 +245,124 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     setSeedLocks({});
     setReusedMedia({});
     setFileValues({});
-    setRunError(null);
   };
 
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeWorkflow || isRunning) return;
+  const showQueuedToast = (msg: string) => {
+    setQueuedFeedback(msg);
+    if (feedbackTimerRef.current) window.clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setQueuedFeedback(null);
+    }, 2200);
+  };
 
-    setIsRunning(true);
-    setRunError(null);
-    setProgressPercent(0);
-    setStepProgress(null);
-    setActiveNodeLabel(null);
-    setStatusMessage('Connecting to ComfyUI...');
-    setElapsedSeconds(0);
-
-    try {
-      // Auto-randomize unlocked seeds
-      const nextValues = { ...formValues };
-      for (const field of activeWorkflow.ui_inputs) {
-        const key = `${field.node_id}:${field.field_name}`;
-        if (field.widget === 'seed_randomizer' && !seedLocks[key]) {
-          nextValues[key] = Math.floor(Math.random() * 2_147_483_647);
-        }
+  const prepareSubmissionValues = () => {
+    if (!activeWorkflow) return null;
+    const nextValues = { ...formValues };
+    for (const field of activeWorkflow.ui_inputs) {
+      const key = `${field.node_id}:${field.field_name}`;
+      if (field.widget === 'seed_randomizer' && !seedLocks[key]) {
+        nextValues[key] = Math.floor(Math.random() * 2_147_483_647);
       }
-      setFormValues(nextValues);
-      saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks, reusedMedia });
-
-      const clientId = generateClientId();
-
-      if (timerRef.current) window.clearInterval(timerRef.current);
-      const startMs = Date.now();
-      timerRef.current = window.setInterval(() => {
-        setElapsedSeconds(Math.floor((Date.now() - startMs) / 1000));
-      }, 1000);
-
-      unsubscribeSseRef.current?.();
-      unsubscribeSseRef.current = api.subscribeProgress(
-        clientId,
-        (evt: ProgressEventPayload) => {
-          if (evt.type === 'status') {
-            setStatusMessage(evt.message || 'Queued on ComfyUI');
-          } else if (evt.type === 'executing') {
-            setActiveNodeLabel(evt.node_title || `Node ${evt.node_id}`);
-            setStatusMessage(`Running ${evt.node_title || evt.node_id}`);
-          } else if (evt.type === 'progress') {
-            if (typeof evt.value === 'number' && typeof evt.max === 'number') {
-              setStepProgress({ value: evt.value, max: evt.max });
-            }
-            if (typeof evt.percent === 'number') {
-              setProgressPercent(evt.percent);
-            }
-          } else if (evt.type === 'completed' && evt.generation) {
-            setIsRunning(false);
-            setProgressPercent(100);
-            setStatusMessage('Completed');
-            setActiveNodeLabel(null);
-            setLatestGeneration(evt.generation);
-            setSelectedOutputIndex(0);
-            onGenerationComplete(evt.generation);
-            if (timerRef.current) window.clearInterval(timerRef.current);
-            unsubscribeSseRef.current?.();
-          } else if (evt.type === 'error') {
-            setIsRunning(false);
-            setRunError(evt.message || 'Generation failed');
-            setStatusMessage('Failed');
-            if (timerRef.current) window.clearInterval(timerRef.current);
-            unsubscribeSseRef.current?.();
-          }
-        },
-      );
-
-      const formData = new FormData();
-      formData.append('workflow_id', String(activeWorkflow.id));
-      formData.append('client_id', clientId);
-      formData.append('inputs_json', JSON.stringify(nextValues));
-
-      const reusedMediaPayload: Record<string, InputMediaInfo> = {};
-      for (const field of activeWorkflow.ui_inputs) {
-        const key = `${field.node_id}:${field.field_name}`;
-        const file = fileValues[key];
-        if (file) {
-          formData.append(`file:${field.node_id}:${field.field_name}`, file);
-        } else if (reusedMedia[key]) {
-          reusedMediaPayload[key] = reusedMedia[key];
-        }
-      }
-      if (Object.keys(reusedMediaPayload).length > 0) {
-        formData.append('reused_media_json', JSON.stringify(reusedMediaPayload));
-      }
-
-      await api.submitGeneration(formData);
-    } catch (err) {
-      setIsRunning(false);
-      if (timerRef.current) window.clearInterval(timerRef.current);
-      unsubscribeSseRef.current?.();
-      setRunError(err instanceof Error ? err.message : 'Failed to queue generation');
-      setStatusMessage('Connection error');
     }
+    setFormValues(nextValues);
+    saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks, reusedMedia });
+    return nextValues;
+  };
+
+  const handleGenerate = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeWorkflow) return;
+    const nextValues = prepareSubmissionValues();
+    if (!nextValues) return;
+
+    const alreadyRunning = queueTasks.some((t) => t.status === 'running');
+    onEnqueueTask({
+      workflow: activeWorkflow,
+      values: nextValues,
+      fileValues,
+      reusedMedia,
+      startNow: true,
+    });
+    if (alreadyRunning) {
+      showQueuedToast(`Queued "${activeWorkflow.name}" after active task`);
+    }
+  };
+
+  const handleAddToQueue = () => {
+    if (!activeWorkflow) return;
+    const nextValues = prepareSubmissionValues();
+    if (!nextValues) return;
+
+    onEnqueueTask({
+      workflow: activeWorkflow,
+      values: nextValues,
+      fileValues,
+      reusedMedia,
+      startNow: false,
+    });
+    showQueuedToast(`Added "${activeWorkflow.name}" to queue`);
   };
 
   const sortedFields = useMemo(() => {
     if (!activeWorkflow) return [];
     return [...activeWorkflow.ui_inputs].sort((a, b) => a.order - b.order);
   }, [activeWorkflow]);
+
+  const runningTask = useMemo(
+    () => queueTasks.find((t) => t.status === 'running') || null,
+    [queueTasks],
+  );
+  const queuedTasks = useMemo(
+    () => queueTasks.filter((t) => t.status === 'queued'),
+    [queueTasks],
+  );
+  const finishedTasks = useMemo(
+    () =>
+      queueTasks.filter(
+        (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled',
+      ),
+    [queueTasks],
+  );
+
+  const selectedOutputTask = useMemo(() => {
+    if (selectedOutputTaskId) {
+      const match = queueTasks.find((t) => t.id === selectedOutputTaskId && t.generation);
+      if (match) return match;
+    }
+    for (let i = queueTasks.length - 1; i >= 0; i--) {
+      if (queueTasks[i].status === 'completed' && queueTasks[i].generation) {
+        return queueTasks[i];
+      }
+    }
+    return null;
+  }, [queueTasks, selectedOutputTaskId]);
+
+  const latestGeneration = selectedOutputTask?.generation || null;
+
+  useEffect(() => {
+    setSelectedOutputIndex(0);
+  }, [selectedOutputTask?.id]);
+
+  const lastTask = queueTasks[queueTasks.length - 1] || null;
+  const displayTask = runningTask || (lastTask && lastTask.status === 'failed' ? lastTask : null) || selectedOutputTask;
+  const statusMessage = runningTask
+    ? runningTask.statusMessage
+    : displayTask?.status === 'failed'
+      ? displayTask.statusMessage
+      : displayTask?.status === 'completed'
+        ? 'Completed'
+        : queuedTasks.length > 0
+          ? `${queuedTasks.length} task${queuedTasks.length > 1 ? 's' : ''} queued`
+          : 'Ready';
+  const progressPercent = runningTask
+    ? runningTask.progressPercent
+    : displayTask?.status === 'completed'
+      ? 100
+      : 0;
+  const stepProgress = runningTask?.stepProgress || null;
+  const activeNodeLabel = runningTask?.activeNodeLabel || null;
+  const elapsedSeconds = runningTask?.elapsedSeconds || 0;
+  const runError = runningTask?.error || (lastTask?.status === 'failed' ? lastTask.error : null);
 
   const currentOutput: OutputFileInfo | null =
     latestGeneration?.outputs?.[selectedOutputIndex] || null;
@@ -559,52 +583,64 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
               </div>
             )}
 
-            <div className="pt-4 border-t border-zinc-800/80 flex items-center justify-between gap-4">
-              <button
-                type="button"
-                onClick={handleResetDefaults}
-                disabled={isRunning}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-zinc-300 bg-zinc-800/70 hover:bg-zinc-800 rounded-md transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                Reset Defaults
-              </button>
+            <div className="pt-4 border-t border-zinc-800/80 space-y-2.5">
+              {queuedFeedback && (
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded bg-blue-950/40 border border-blue-800/60 text-xs text-blue-300">
+                  <Check className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">{queuedFeedback}</span>
+                </div>
+              )}
 
-              <button
-                type="submit"
-                disabled={isRunning}
-                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-md transition-colors cursor-pointer disabled:opacity-60"
-              >
-                {isRunning ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Generating...
-                  </>
-                ) : (
-                  <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={handleResetDefaults}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-zinc-300 bg-zinc-800/70 hover:bg-zinc-800 rounded-md transition-colors cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Reset Defaults
+                </button>
+
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleAddToQueue}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium text-zinc-100 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/80 rounded-md transition-colors cursor-pointer"
+                  >
+                    <ListPlus className="w-4 h-4 text-zinc-300" />
+                    Add to Queue
+                  </button>
+
+                  <button
+                    type="submit"
+                    className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-md transition-colors cursor-pointer"
+                  >
                     <Play className="w-4 h-4 fill-current" />
-                    Generate Output
-                  </>
-                )}
-              </button>
+                    {runningTask ? 'Queue & Start Next' : 'Generate Output'}
+                  </button>
+                </div>
+              </div>
             </div>
           </form>
         )}
       </section>
 
-      {/* Right Panel: Execution Progress & Live Output Preview */}
+      {/* Right Panel: Execution Progress, Running Queue & Live Output Preview */}
       <section className="w-[440px] xl:w-[500px] shrink-0 bg-[#12151B] flex flex-col min-h-0">
-        <div className="p-4 border-b border-zinc-800/80 space-y-3">
-          <div className="flex items-center justify-between text-xs">
-            <span className="font-medium text-zinc-200">{statusMessage}</span>
-            <div className="flex items-center gap-3 font-mono text-zinc-400 tabular-nums">
+        <div className="p-4 border-b border-zinc-800/80 space-y-2.5 shrink-0">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              {runningTask && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />}
+              <span className="font-medium text-zinc-200 truncate">{statusMessage}</span>
+            </div>
+            <div className="flex items-center gap-3 font-mono text-zinc-400 tabular-nums shrink-0">
               {stepProgress && (
                 <span>
                   Step {stepProgress.value}/{stepProgress.max}
                 </span>
               )}
               <span>{progressPercent}%</span>
-              {(isRunning || elapsedSeconds > 0) && <span>{elapsedSeconds}s</span>}
+              {(Boolean(runningTask) || elapsedSeconds > 0) && <span>{elapsedSeconds}s</span>}
             </div>
           </div>
 
@@ -638,6 +674,220 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
               </button>
             </div>
           )}
+        </div>
+
+        {/* Running Queue Section */}
+        <div className="border-b border-zinc-800/80 bg-[#0E1117] flex flex-col shrink-0">
+          <div className="px-4 py-2.5 border-b border-zinc-800/60 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <h2 className="text-xs font-semibold text-zinc-200">Running Queue</h2>
+              <span className="text-[11px] font-mono text-zinc-500 tabular-nums truncate">
+                {runningTask ? '1 running' : 'Idle'} · {queuedTasks.length} queued
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              {queuedTasks.length > 0 && !isQueueRunning && (
+                <button
+                  type="button"
+                  onClick={onStartQueue}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-white bg-blue-600 hover:bg-blue-500 rounded transition-colors cursor-pointer"
+                >
+                  <Play className="w-3 h-3 fill-current" />
+                  Start Queue
+                </button>
+              )}
+              {isQueueRunning && (runningTask || queuedTasks.length > 0) && (
+                <button
+                  type="button"
+                  onClick={onPauseQueue}
+                  title="Pause after active task finishes"
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors cursor-pointer"
+                >
+                  <Pause className="w-3 h-3" />
+                  Pause
+                </button>
+              )}
+              {finishedTasks.length > 0 && (
+                <button
+                  type="button"
+                  onClick={onClearFinishedTasks}
+                  className="px-2 py-1 text-[11px] font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded transition-colors cursor-pointer"
+                >
+                  Clear Done
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="max-h-[210px] overflow-y-auto divide-y divide-zinc-800/60">
+            {queueTasks.length === 0 ? (
+              <div className="px-4 py-3 text-xs text-zinc-500">
+                Queue is empty. Click Generate Output to run now or Add to Queue to batch tasks.
+              </div>
+            ) : (
+              (() => {
+                let queuedIndex = 0;
+                return queueTasks.map((task) => {
+                  const currentQueuedPos = task.status === 'queued' ? ++queuedIndex : 0;
+                  const isPreviewSelected = selectedOutputTask?.id === task.id;
+                  return (
+                    <div
+                      key={task.id}
+                      className={`px-4 py-2.5 space-y-1.5 transition-colors ${
+                        isPreviewSelected
+                          ? 'bg-blue-950/20'
+                          : task.status === 'running'
+                            ? 'bg-zinc-900/50'
+                            : 'hover:bg-zinc-900/30'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          disabled={task.status !== 'completed' || !task.generation}
+                          onClick={() => {
+                            if (task.status === 'completed' && task.generation) {
+                              onSelectOutputTask(task.id);
+                            }
+                          }}
+                          className={`flex-1 min-w-0 flex items-start gap-2 text-left ${
+                            task.status === 'completed' && task.generation
+                              ? 'cursor-pointer'
+                              : 'cursor-default'
+                          }`}
+                        >
+                          <span className="mt-0.5 shrink-0">
+                            {task.status === 'running' && (
+                              <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />
+                            )}
+                            {task.status === 'queued' && (
+                              <span className="inline-block font-mono text-[11px] text-zinc-400 tabular-nums">
+                                #{currentQueuedPos}
+                              </span>
+                            )}
+                            {task.status === 'completed' && (
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                            )}
+                            {task.status === 'failed' && (
+                              <AlertCircle className="w-3.5 h-3.5 text-red-400" />
+                            )}
+                            {task.status === 'cancelled' && (
+                              <XCircle className="w-3.5 h-3.5 text-zinc-500" />
+                            )}
+                          </span>
+
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2 text-xs">
+                              <span className="font-medium text-zinc-200 truncate">
+                                {task.workflowName}
+                              </span>
+                              <span className="font-mono text-[11px] text-zinc-500 tabular-nums shrink-0">
+                                {task.status === 'running' &&
+                                  `${task.progressPercent}% · ${task.elapsedSeconds}s`}
+                                {task.status === 'queued' && 'Queued'}
+                                {task.status === 'completed' &&
+                                  `${((task.generation?.duration_ms || 0) / 1000).toFixed(1)}s`}
+                                {task.status === 'failed' && (
+                                  <span className="text-red-400">Failed</span>
+                                )}
+                                {task.status === 'cancelled' && 'Cancelled'}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-zinc-500 truncate mt-0.5">
+                              {task.status === 'failed' && task.error
+                                ? task.error
+                                : task.status === 'running' && task.activeNodeLabel
+                                  ? `${task.activeNodeLabel} · ${task.summaryText}`
+                                  : task.summaryText}
+                            </p>
+                          </div>
+                        </button>
+
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          {task.status === 'queued' && !runningTask && (
+                            <button
+                              type="button"
+                              onClick={() => onRunTaskNow(task.id)}
+                              title="Start this task now"
+                              aria-label={`Start ${task.workflowName}`}
+                              className="p-1 text-blue-400 hover:text-blue-300 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <Play className="w-3 h-3 fill-current" />
+                            </button>
+                          )}
+                          {task.status === 'queued' && currentQueuedPos > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => onMoveTaskUp(task.id)}
+                              title="Move up in queue"
+                              aria-label="Move up in queue"
+                              className="p-1 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <ChevronUp className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {task.status === 'running' && (
+                            <button
+                              type="button"
+                              onClick={() => onCancelTask(task.id)}
+                              title="Stop waiting for this task"
+                              aria-label="Cancel running task"
+                              className="p-1 text-amber-400 hover:text-amber-300 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <Square className="w-3 h-3 fill-current" />
+                            </button>
+                          )}
+                          {(task.status === 'failed' || task.status === 'cancelled') && (
+                            <button
+                              type="button"
+                              onClick={() => onRetryTask(task.id)}
+                              title="Retry task"
+                              aria-label="Retry task"
+                              className="p-1 text-zinc-400 hover:text-blue-400 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                            </button>
+                          )}
+                          {task.status === 'completed' && (
+                            <button
+                              type="button"
+                              onClick={() => onRequeueTask(task.id)}
+                              title="Run again in queue"
+                              aria-label="Re-queue task"
+                              className="p-1 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                            </button>
+                          )}
+                          {task.status !== 'running' && (
+                            <button
+                              type="button"
+                              onClick={() => onRemoveTask(task.id)}
+                              title="Remove from queue"
+                              aria-label="Remove task"
+                              className="p-1 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 rounded cursor-pointer"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {task.status === 'running' && (
+                        <div className="h-1 w-full bg-[#0B0D11] rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-500 transition-all duration-200"
+                            style={{ width: `${Math.min(100, Math.max(0, task.progressPercent))}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                });
+              })()
+            )}
+          </div>
         </div>
 
         <div className="flex-1 min-h-0 p-4 flex flex-col">
