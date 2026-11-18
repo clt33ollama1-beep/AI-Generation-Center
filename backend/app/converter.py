@@ -1,3 +1,4 @@
+import json
 from typing import Any
 from urllib.parse import unquote
 
@@ -339,6 +340,18 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
             skipped_nodes += 1
             continue
 
+        if node_type == "dehypnotic_AspectRatio":
+            props = node.get("properties") or {}
+            prop_state = props.get("resolutionState") if isinstance(props, dict) else None
+            ui_state = api_inputs.get("aspect_ratio_ui")
+            if isinstance(prop_state, str) and prop_state.strip():
+                api_inputs["ResolutionState"] = prop_state
+            elif ui_state is not None:
+                api_inputs["ResolutionState"] = (
+                    ui_state if isinstance(ui_state, str) else json.dumps(ui_state, ensure_ascii=False)
+                )
+            api_inputs.pop("aspect_ratio_ui", None)
+
         api_workflow[node_id] = {
             "class_type": node_type,
             "inputs": api_inputs,
@@ -437,6 +450,18 @@ def normalize_comfy_workflow_payload(payload: Any) -> dict[str, Any]:
         }
 
     api_workflow = payload if isinstance(payload, dict) else {}
+    for node in api_workflow.values():
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            continue
+        if node.get("class_type") == "dehypnotic_AspectRatio" and "ResolutionState" not in node["inputs"]:
+            inputs_dict = node["inputs"]
+            raw = inputs_dict.get("aspect_ratio_ui", inputs_dict.get("resolutionState"))
+            if raw is not None:
+                inputs_dict["ResolutionState"] = (
+                    raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                )
+                inputs_dict.pop("aspect_ratio_ui", None)
+                inputs_dict.pop("resolutionState", None)
     output_meta = extract_workflow_outputs(api_workflow, [])
     return {
         "workflow": api_workflow,

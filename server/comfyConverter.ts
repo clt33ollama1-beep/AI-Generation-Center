@@ -24,6 +24,7 @@ interface GraphNode {
   type: string;
   title?: string;
   mode?: number;
+  properties?: Record<string, unknown>;
   inputs?: GraphInputSlot[];
   outputs?: GraphOutputSlot[];
   widgets_values?: unknown;
@@ -414,6 +415,18 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
       continue;
     }
 
+    if (node.type === 'dehypnotic_AspectRatio') {
+      const propState = node.properties?.resolutionState;
+      const uiState = apiInputs.aspect_ratio_ui;
+      if (typeof propState === 'string' && propState.trim()) {
+        apiInputs.ResolutionState = propState;
+      } else if (uiState !== undefined) {
+        apiInputs.ResolutionState =
+          typeof uiState === 'string' ? uiState : JSON.stringify(uiState);
+      }
+      delete apiInputs.aspect_ratio_ui;
+    }
+
     const apiNode: ComfyNode = {
       class_type: node.type,
       inputs: apiInputs,
@@ -520,6 +533,19 @@ export function normalizeComfyWorkflowPayload(payload: unknown): NormalizedWorkf
   const apiWorkflow = (
     payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
   ) as ComfyApiWorkflow;
+
+  for (const node of Object.values(apiWorkflow)) {
+    if (!node || typeof node !== 'object' || !node.inputs) continue;
+    if (node.class_type === 'dehypnotic_AspectRatio' && !('ResolutionState' in node.inputs)) {
+      const raw = node.inputs.aspect_ratio_ui ?? node.inputs.resolutionState;
+      if (raw !== undefined) {
+        node.inputs.ResolutionState = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        delete node.inputs.aspect_ratio_ui;
+        delete node.inputs.resolutionState;
+      }
+    }
+  }
+
   const outputMeta = extractWorkflowOutputs(apiWorkflow, []);
 
   return {
