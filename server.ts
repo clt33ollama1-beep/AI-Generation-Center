@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import multer from 'multer';
 import WebSocket from 'ws';
 import { createServer as createViteServer } from 'vite';
+import { normalizeComfyWorkflowPayload } from './server/comfyConverter.ts';
 import { SEED_CATEGORIES, SEED_WORKFLOWS } from './server/seedData.ts';
 import type {
   ComfyApiWorkflow,
@@ -155,6 +156,7 @@ function isNodeLinkArray(value: unknown): boolean {
 const MEDIA_NODE_TYPES = new Set([
   'LoadImage',
   'LoadImageMask',
+  'LoadImageGoohai',
   'VHS_LoadVideo',
   'VHS_LoadVideoPath',
   'VHS_LoadImages',
@@ -207,7 +209,12 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
       } else {
         valueType = 'string';
         const strVal = String(defaultValue);
-        if (lowerField === 'text' || lowerField.includes('prompt') || strVal.length > 48) {
+        if (
+          lowerField === 'text' ||
+          lowerField.includes('prompt') ||
+          node.class_type.toLowerCase().includes('multiline') ||
+          strVal.length > 48
+        ) {
           suggestedWidget = 'textarea';
         } else {
           suggestedWidget = 'text';
@@ -233,7 +240,12 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
     }
   }
 
-  return inspectedNodes.sort((a, b) => Number(a.node_id) - Number(b.node_id));
+  return inspectedNodes.sort((a, b) => {
+    const aNum = Number(a.node_id);
+    const bNum = Number(b.node_id);
+    if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+    return a.node_id.localeCompare(b.node_id);
+  });
 }
 
 function mapWorkflowRow(row: Record<string, unknown>) {
@@ -525,11 +537,18 @@ app.delete('/api/categories/:id', (req: Request, res: Response) => {
 app.post('/api/workflows/inspect', (req: Request, res: Response) => {
   const workflowJson = req.body?.comfy_api_json;
   if (!workflowJson || typeof workflowJson !== 'object' || Array.isArray(workflowJson)) {
-    res.status(400).json({ detail: 'comfy_api_json must be a ComfyUI API-format JSON object' });
+    res.status(400).json({ detail: 'comfy_api_json must be a ComfyUI API or workflow JSON object' });
     return;
   }
-  const nodes = inspectComfyWorkflow(workflowJson as ComfyApiWorkflow);
-  res.json({ nodes });
+  const normalized = normalizeComfyWorkflowPayload(workflowJson);
+  const nodes = inspectComfyWorkflow(normalized.workflow);
+  res.json({
+    nodes,
+    source_format: normalized.source_format,
+    converted_api_json: normalized.workflow,
+    suggested_field_keys: normalized.suggested_field_keys,
+    conversion_stats: normalized.conversion_stats ?? null,
+  });
 });
 
 // Workflows CRUD
@@ -575,6 +594,8 @@ app.post('/api/workflows', (req: Request, res: Response) => {
     return;
   }
 
+  const normalizedWorkflow = normalizeComfyWorkflowPayload(comfyApiJson).workflow;
+
   const result = db
     .prepare(`
       INSERT INTO workflows (name, description, category_id, output_type, comfy_api_json, ui_inputs_json)
@@ -585,7 +606,7 @@ app.post('/api/workflows', (req: Request, res: Response) => {
       description,
       categoryId,
       outputType,
-      JSON.stringify(comfyApiJson),
+      JSON.stringify(normalizedWorkflow),
       JSON.stringify(uiInputs),
     );
 
@@ -613,7 +634,7 @@ app.put('/api/workflows/:id', (req: Request, res: Response) => {
   const categoryId = Number(req.body?.category_id ?? existing.category_id);
   const outputType = String(req.body?.output_type ?? existing.output_type);
   const comfyApiJson = req.body?.comfy_api_json
-    ? JSON.stringify(req.body.comfy_api_json)
+    ? JSON.stringify(normalizeComfyWorkflowPayload(req.body.comfy_api_json).workflow)
     : String(existing.comfy_api_json);
   const uiInputsJson = req.body?.ui_inputs
     ? JSON.stringify(req.body.ui_inputs)
@@ -771,8 +792,9 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
     return;
   }
 
+  const normalizedTemplate = normalizeComfyWorkflowPayload(workflowTemplate.comfy_api_json).workflow;
   const workflowCopy: ComfyApiWorkflow = JSON.parse(
-    JSON.stringify(workflowTemplate.comfy_api_json),
+    JSON.stringify(normalizedTemplate),
   );
 
   // 1. Forward uploaded media files to ComfyUI /upload/image

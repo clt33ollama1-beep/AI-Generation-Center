@@ -4,6 +4,7 @@ from app.schemas import InspectedInput, InspectedNode, WidgetType
 MEDIA_NODE_TYPES = {
     "LoadImage",
     "LoadImageMask",
+    "LoadImageGoohai",
     "VHS_LoadVideo",
     "VHS_LoadVideoPath",
     "VHS_LoadImages",
@@ -70,7 +71,12 @@ def inspect_comfy_workflow(workflow: dict[str, Any]) -> list[InspectedNode]:
             else:
                 value_type = "string"
                 str_val = str(default_val)
-                if lower_field == "text" or "prompt" in lower_field or len(str_val) > 48:
+                if (
+                    lower_field == "text"
+                    or "prompt" in lower_field
+                    or "multiline" in class_type.lower()
+                    or len(str_val) > 48
+                ):
                     suggested_widget = "textarea"
                 else:
                     suggested_widget = "text"

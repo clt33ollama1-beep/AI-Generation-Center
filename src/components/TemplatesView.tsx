@@ -62,6 +62,33 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [nodeFilter, setNodeFilter] = useState('');
+
+  const buildDefaultMappedField = (
+    node: InspectedNode,
+    input: InspectedNode['inputs'][number],
+    order: number,
+  ): UIInputField => {
+    const key = `${node.node_id}:${input.field_name}`;
+    const cleanFieldLabel = input.field_name
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+    return {
+      id: key,
+      node_id: node.node_id,
+      class_type: node.class_type,
+      field_name: input.field_name,
+      label: `${node.title} — ${cleanFieldLabel}`,
+      widget: input.suggested_widget,
+      value_type: input.value_type,
+      default_value: input.default_value,
+      min: input.value_type === 'int' || input.value_type === 'float' ? 0 : undefined,
+      max: input.value_type === 'int' || input.value_type === 'float' ? 100 : undefined,
+      step: input.value_type === 'float' ? 0.1 : 1,
+      options: input.suggested_widget === 'select' ? [String(input.default_value)] : undefined,
+      order,
+    };
+  };
 
   const startNewTemplate = () => {
     setEditingId(null);
@@ -117,14 +144,14 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     }
   };
 
-  const runInspect = async (jsonString: string) => {
+  const runInspect = async (jsonString: string, resetMapping = false) => {
     setError(null);
     setNotice(null);
-    let parsed: ComfyApiWorkflow;
+    let parsed: Record<string, unknown>;
     try {
-      parsed = JSON.parse(jsonString) as ComfyApiWorkflow;
+      parsed = JSON.parse(jsonString) as Record<string, unknown>;
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('JSON root must be an object keyed by ComfyUI node IDs');
+        throw new Error('JSON root must be a ComfyUI workflow or API JSON object');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Invalid JSON format');
@@ -134,10 +161,43 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     setInspecting(true);
     try {
       const res = await api.inspectWorkflow(parsed);
-      setParsedWorkflow(parsed);
+      const executableWorkflow = (res.converted_api_json || parsed) as ComfyApiWorkflow;
+      setParsedWorkflow(executableWorkflow);
       setInspectedNodes(res.nodes);
+
+      const suggestedKeys = res.suggested_field_keys || [];
+      let autoMappedCount = 0;
+      if ((resetMapping || Object.keys(mappedFields).length === 0) && suggestedKeys.length > 0) {
+        const autoMapped: Record<string, UIInputField> = {};
+        let order = 1;
+        for (const key of suggestedKeys) {
+          const colonIdx = key.indexOf(':');
+          if (colonIdx === -1) continue;
+          const targetNodeId = key.slice(0, colonIdx);
+          const targetFieldName = key.slice(colonIdx + 1);
+          const foundNode = res.nodes.find((n) => n.node_id === targetNodeId);
+          const foundInput = foundNode?.inputs.find((i) => i.field_name === targetFieldName);
+          if (foundNode && foundInput) {
+            autoMapped[key] = buildDefaultMappedField(foundNode, foundInput, order++);
+            autoMappedCount++;
+          }
+        }
+        if (autoMappedCount > 0) {
+          setMappedFields(autoMapped);
+        }
+      }
+
       if (res.nodes.length === 0) {
-        setError('No editable primitive inputs found. Make sure you exported using "Save (API Format)" in ComfyUI.');
+        setError('No editable primitive inputs found in this ComfyUI JSON.');
+      } else if (res.source_format === 'workflow' && res.conversion_stats) {
+        const stats = res.conversion_stats;
+        const autoHint =
+          autoMappedCount > 0
+            ? ` Pre-selected ${autoMappedCount} primary workflow app inputs.`
+            : '';
+        setNotice(
+          `Converted ComfyUI workflow graph to API format (${stats.converted_api_nodes} active nodes, ${stats.skipped_nodes} bypassed/virtual nodes omitted).${autoHint}`,
+        );
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to inspect ComfyUI JSON');
@@ -152,9 +212,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     const text = await file.text();
     setRawJsonText(text);
     if (!name.trim()) {
-      setName(file.name.replace(/\.json$/i, ''));
+      setName(file.name.replace(/(\.app)?\.json$/i, ''));
     }
-    await runInspect(text);
+    await runInspect(text, !editingId);
   };
 
   const toggleFieldMapping = (
@@ -169,24 +229,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
         delete next[key];
       } else {
         const currentCount = Object.keys(next).length;
-        const cleanFieldLabel = input.field_name
-          .replace(/_/g, ' ')
-          .replace(/\b\w/g, (c) => c.toUpperCase());
-        next[key] = {
-          id: key,
-          node_id: node.node_id,
-          class_type: node.class_type,
-          field_name: input.field_name,
-          label: `${node.title} — ${cleanFieldLabel}`,
-          widget: input.suggested_widget,
-          value_type: input.value_type,
-          default_value: input.default_value,
-          min: input.value_type === 'int' || input.value_type === 'float' ? 0 : undefined,
-          max: input.value_type === 'int' || input.value_type === 'float' ? 100 : undefined,
-          step: input.value_type === 'float' ? 0.1 : 1,
-          options: input.suggested_widget === 'select' ? [String(input.default_value)] : undefined,
-          order: currentCount + 1,
-        };
+        next[key] = buildDefaultMappedField(node, input, currentCount + 1);
       }
       return next;
     });
@@ -403,7 +446,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                 {editingId ? `Edit Template: ${name || 'Untitled'}` : 'Create Workflow Template'}
               </h1>
               <p className="text-xs text-zinc-400 mt-1">
-                Upload a ComfyUI "Save (API Format)" JSON file to inspect nodes and map primitive inputs to generation controls.
+                Upload a ComfyUI "Save (API Format)" or workflow graph JSON (.json / .app.json) file to inspect nodes and map inputs to generation controls.
               </p>
             </div>
 
@@ -508,7 +551,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
               <div className="flex items-center gap-2">
                 <FileJson className="w-4 h-4 text-zinc-400" />
                 <h3 className="text-sm font-semibold text-zinc-100">
-                  ComfyUI API Format JSON
+                  ComfyUI Workflow / API JSON
                 </h3>
               </div>
 
@@ -538,7 +581,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
               rows={6}
               value={rawJsonText}
               onChange={(e) => setRawJsonText(e.target.value)}
-              placeholder='Paste JSON exported from ComfyUI via "Save (API Format)"...'
+              placeholder='Paste JSON exported from ComfyUI ("Save (API Format)" or standard workflow .json / .app.json)...'
               className="w-full px-3 py-2.5 text-xs font-mono bg-[#0B0D11] border border-zinc-800 rounded-md text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
             />
           </div>
@@ -546,17 +589,39 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           {/* Dynamic Node Field Mapper */}
           {inspectedNodes.length > 0 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <h3 className="text-sm font-semibold text-zinc-100">
                   Node Input Mapping ({Object.keys(mappedFields).length} exposed)
                 </h3>
-                <span className="text-xs text-zinc-500 tabular-nums">
-                  {inspectedNodes.length} nodes with editable fields
-                </span>
+                <div className="flex items-center gap-3">
+                  {inspectedNodes.length > 6 && (
+                    <input
+                      type="text"
+                      value={nodeFilter}
+                      onChange={(e) => setNodeFilter(e.target.value)}
+                      placeholder="Filter nodes or fields..."
+                      className="px-2.5 py-1 text-xs bg-[#12151B] border border-zinc-800 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+                    />
+                  )}
+                  <span className="text-xs text-zinc-500 tabular-nums">
+                    {inspectedNodes.length} nodes with editable fields
+                  </span>
+                </div>
               </div>
 
               <div className="space-y-4">
-                {inspectedNodes.map((node) => (
+                {inspectedNodes
+                  .filter((node) => {
+                    const q = nodeFilter.trim().toLowerCase();
+                    if (!q) return true;
+                    return (
+                      node.title.toLowerCase().includes(q) ||
+                      node.class_type.toLowerCase().includes(q) ||
+                      node.node_id.includes(q) ||
+                      node.inputs.some((i) => i.field_name.toLowerCase().includes(q))
+                    );
+                  })
+                  .map((node) => (
                   <div
                     key={node.node_id}
                     className="rounded-lg border border-zinc-800 bg-[#12151B] overflow-hidden"

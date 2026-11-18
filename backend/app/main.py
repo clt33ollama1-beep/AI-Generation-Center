@@ -20,6 +20,7 @@ from app.comfy_client import (
     upload_media_to_comfyui,
 )
 from app.config import settings
+from app.converter import normalize_comfy_workflow_payload
 from app.database import engine, get_session, init_db
 from app.inspector import inspect_comfy_workflow
 from app.models import (
@@ -203,8 +204,15 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
 
 @app.post("/api/workflows/inspect", response_model=WorkflowInspectResponse)
 def inspect_workflow(payload: WorkflowInspectRequest):
-    nodes = inspect_comfy_workflow(payload.comfy_api_json)
-    return WorkflowInspectResponse(nodes=nodes)
+    normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+    nodes = inspect_comfy_workflow(normalized["workflow"])
+    return WorkflowInspectResponse(
+        nodes=nodes,
+        source_format=normalized["source_format"],
+        converted_api_json=normalized["workflow"],
+        suggested_field_keys=normalized["suggested_field_keys"],
+        conversion_stats=normalized["conversion_stats"],
+    )
 
 
 @app.get("/api/workflows", response_model=list[WorkflowRead])
@@ -228,12 +236,13 @@ def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_sess
     cat = session.get(Category, payload.category_id)
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+    normalized_wf = normalize_comfy_workflow_payload(payload.comfy_api_json)["workflow"]
     wf = WorkflowTemplate(
         name=payload.name.strip(),
         description=payload.description.strip(),
         category_id=payload.category_id,
         output_type=payload.output_type,
-        comfy_api_json=json.dumps(payload.comfy_api_json),
+        comfy_api_json=json.dumps(normalized_wf),
         ui_inputs_json=json.dumps([item.model_dump() for item in payload.ui_inputs]),
     )
     session.add(wf)
@@ -260,7 +269,8 @@ def update_workflow(
     if payload.output_type is not None:
         wf.output_type = payload.output_type
     if payload.comfy_api_json is not None:
-        wf.comfy_api_json = json.dumps(payload.comfy_api_json)
+        normalized_wf = normalize_comfy_workflow_payload(payload.comfy_api_json)["workflow"]
+        wf.comfy_api_json = json.dumps(normalized_wf)
     if payload.ui_inputs is not None:
         wf.ui_inputs_json = json.dumps([item.model_dump() for item in payload.ui_inputs])
     wf.updated_at = utcnow_iso()
@@ -392,7 +402,10 @@ async def generate_output(
         raise HTTPException(status_code=400, detail="Invalid inputs_json payload") from exc
 
     comfy_url = get_comfyui_url(session)
-    workflow_copy: dict[str, Any] = copy.deepcopy(json.loads(wf.comfy_api_json))
+    stored_wf = json.loads(wf.comfy_api_json)
+    workflow_copy: dict[str, Any] = copy.deepcopy(
+        normalize_comfy_workflow_payload(stored_wf)["workflow"]
+    )
     ui_inputs = [UIInputField(**item) for item in json.loads(wf.ui_inputs_json)]
 
     # 1. Forward uploaded media files to ComfyUI /upload/image

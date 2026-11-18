@@ -74,6 +74,18 @@ export interface InspectedNode {
   inputs: InspectedInput[];
 }
 
+export interface WorkflowInspectResponse {
+  nodes: InspectedNode[];
+  source_format?: 'api' | 'workflow';
+  converted_api_json?: ComfyApiWorkflow;
+  suggested_field_keys?: string[];
+  conversion_stats?: {
+    total_graph_nodes: number;
+    converted_api_nodes: number;
+    skipped_nodes: number;
+  } | null;
+}
+
 export interface OutputFileInfo {
   filename: string;
   original_filename: string;

@@ -76,8 +76,18 @@ class InspectedNode(BaseModel):
     inputs: list[InspectedInput]
 
 
+class ConversionStats(BaseModel):
+    total_graph_nodes: int
+    converted_api_nodes: int
+    skipped_nodes: int
+
+
 class WorkflowInspectResponse(BaseModel):
     nodes: list[InspectedNode]
+    source_format: Literal["api", "workflow"] = "api"
+    converted_api_json: dict[str, Any] = Field(default_factory=dict)
+    suggested_field_keys: list[str] = Field(default_factory=list)
+    conversion_stats: Optional[ConversionStats] = None
 
 
 class WorkflowCreate(BaseModel):

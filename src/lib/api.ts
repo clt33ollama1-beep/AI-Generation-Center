@@ -3,10 +3,10 @@ import type {
   ComfyApiWorkflow,
   ComfyHealthResponse,
   GenerationRecord,
-  InspectedNode,
   OutputMediaType,
   ProgressEventPayload,
   UIInputField,
+  WorkflowInspectResponse,
   WorkflowTemplate,
 } from '../types/comfy.ts';
 
@@ -51,8 +51,8 @@ export const api = {
 
   listWorkflows: () => requestJson<WorkflowTemplate[]>('/api/workflows'),
 
-  inspectWorkflow: (comfy_api_json: ComfyApiWorkflow) =>
-    requestJson<{ nodes: InspectedNode[] }>('/api/workflows/inspect', {
+  inspectWorkflow: (comfy_api_json: Record<string, unknown>) =>
+    requestJson<WorkflowInspectResponse>('/api/workflows/inspect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ comfy_api_json }),
