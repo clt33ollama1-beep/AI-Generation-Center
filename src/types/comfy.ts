@@ -117,6 +117,10 @@ export interface OutputFileInfo {
   media_type: 'image' | 'video';
   format: string;
   node_id: string;
+  width?: number | null;
+  height?: number | null;
+  duration_seconds?: number | null;
+  file_size?: number | null;
 }
 
 export interface InputMediaInfo {
@@ -129,6 +133,10 @@ export interface InputMediaInfo {
   comfy_name: string;
   url: string;
   media_type: 'image' | 'video';
+  width?: number | null;
+  height?: number | null;
+  duration_seconds?: number | null;
+  file_size?: number | null;
 }
 
 export interface GenerationRecord {
@@ -200,6 +208,7 @@ export interface QueueTaskItem {
   step_max?: number | null;
   progress_percent: number;
   submitted_inputs: Record<string, unknown>;
+  outputs?: OutputFileInfo[];
   error_message?: string | null;
   started_at?: string | null;
   finished_at?: string | null;

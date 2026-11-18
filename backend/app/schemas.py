@@ -154,6 +154,10 @@ class OutputFileInfo(BaseModel):
     media_type: Literal["image", "video"]
     format: str
     node_id: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    file_size: Optional[int] = None
 
 
 class InputMediaInfo(BaseModel):
@@ -166,6 +170,10 @@ class InputMediaInfo(BaseModel):
     comfy_name: str
     url: str
     media_type: Literal["image", "video"]
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    file_size: Optional[int] = None
 
 
 class GenerationRead(BaseModel):
@@ -206,6 +214,7 @@ class QueueTaskItem(BaseModel):
     step_max: Optional[int] = None
     progress_percent: int = 0
     submitted_inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: list[OutputFileInfo] = Field(default_factory=list)
     error_message: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None

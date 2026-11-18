@@ -17,6 +17,11 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api } from '../lib/api.ts';
+import {
+  formatDimensions,
+  formatFileSize,
+  formatVideoDuration,
+} from '../lib/mediaMeta.ts';
 import type { QueueStatusResponse, QueueTaskItem } from '../types/comfy.ts';
 
 interface QueuingViewProps {
@@ -288,6 +293,30 @@ export const QueuingView: React.FC<QueuingViewProps> = ({
                     <span className="font-mono text-zinc-500">{task.node_count} nodes</span>
                   </>
                 )}
+                {task.outputs && task.outputs.length > 0 && (() => {
+                  const primaryOut = task.outputs[0];
+                  const dims = formatDimensions(primaryOut.width, primaryOut.height);
+                  const vidDur =
+                    primaryOut.media_type === 'video'
+                      ? formatVideoDuration(primaryOut.duration_seconds)
+                      : null;
+                  const fSize = formatFileSize(primaryOut.file_size);
+                  const summary = [
+                    primaryOut.format?.toUpperCase(),
+                    dims,
+                    vidDur,
+                    fSize,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ');
+                  if (!summary) return null;
+                  return (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono text-zinc-300">{summary}</span>
+                    </>
+                  );
+                })()}
                 {task.source === 'external' && (
                   <>
                     <span aria-hidden="true">·</span>

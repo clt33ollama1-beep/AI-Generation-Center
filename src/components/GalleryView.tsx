@@ -13,6 +13,12 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../lib/api.ts';
+import {
+  formatFileSize,
+  formatVideoDuration,
+  resolveMediaMeta,
+  type MeasuredMediaMeta,
+} from '../lib/mediaMeta.ts';
 import type { Category, GenerationRecord, WorkflowTemplate } from '../types/comfy.ts';
 
 interface GalleryViewProps {
@@ -31,6 +37,10 @@ interface LightboxMedia {
   title: string;
   filename: string;
   mediaType: 'image' | 'video';
+  width?: number | null;
+  height?: number | null;
+  durationSeconds?: number | null;
+  fileSize?: number | null;
 }
 
 function parseTimestampMs(iso: string): number {
@@ -67,8 +77,32 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [selectedOutputIndex, setSelectedOutputIndex] = useState(0);
   const [lightboxMedia, setLightboxMedia] = useState<LightboxMedia | null>(null);
   const [lightboxMode, setLightboxMode] = useState<'original' | 'fit'>('original');
-  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{
+    width: number;
+    height: number;
+    durationSeconds?: number | null;
+  } | null>(null);
+  const [measuredByUrl, setMeasuredByUrl] = useState<Record<string, MeasuredMediaMeta>>({});
   const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  const recordMeasuredMedia = (url: string, meta: MeasuredMediaMeta) => {
+    if (!url) return;
+    setMeasuredByUrl((prev) => {
+      const existing = prev[url];
+      if (
+        existing &&
+        existing.width === meta.width &&
+        existing.height === meta.height &&
+        existing.durationSeconds === meta.durationSeconds
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [url]: { ...existing, ...meta },
+      };
+    });
+  };
 
   const categoryOptions = useMemo(() => {
     const seen = new Set<string>();
@@ -153,9 +187,22 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   };
 
   const openOriginalLightbox = (media: LightboxMedia) => {
-    setNaturalSize(null);
+    const measured = measuredByUrl[media.url];
+    const resolvedW = media.width ?? measured?.width ?? null;
+    const resolvedH = media.height ?? measured?.height ?? null;
+    const resolvedDur = media.durationSeconds ?? measured?.durationSeconds ?? null;
+    setNaturalSize(
+      resolvedW && resolvedH
+        ? { width: resolvedW, height: resolvedH, durationSeconds: resolvedDur }
+        : null,
+    );
     setLightboxMode('original');
-    setLightboxMedia(media);
+    setLightboxMedia({
+      ...media,
+      width: resolvedW,
+      height: resolvedH,
+      durationSeconds: resolvedDur,
+    });
   };
 
   const handleDelete = async (id: number) => {
@@ -185,6 +232,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
   const activeOutput = activeItem
     ? activeItem.outputs[selectedOutputIndex] || activeItem.outputs[0] || null
+    : null;
+  const activeOutputMeta = activeOutput
+    ? resolveMediaMeta(activeOutput, measuredByUrl[activeOutput.url])
     : null;
 
   return (
@@ -303,6 +353,26 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               const primary = item.outputs[0];
               const isVideo = item.media_type === 'video' || primary?.media_type === 'video';
               const hasInputs = Boolean(item.input_media && item.input_media.length > 0);
+              const primaryMeta = primary
+                ? resolveMediaMeta(primary, measuredByUrl[primary.url])
+                : null;
+              const rightSpecParts = [
+                primaryMeta?.dimensionsText,
+                isVideo ? primaryMeta?.durationText : null,
+                primaryMeta?.fileSizeText || (primary?.format ? primary.format.toUpperCase() : item.media_type.toUpperCase()),
+              ].filter(Boolean) as string[];
+              const rightSpecSummary = rightSpecParts.join(' · ');
+              const fullTooltip = [
+                primaryMeta?.dimensionsText ? `Size: ${primaryMeta.dimensionsText}` : null,
+                isVideo && primaryMeta?.durationText ? `Duration: ${primaryMeta.durationText}` : null,
+                primaryMeta?.fileSizeText ? `File: ${primaryMeta.fileSizeText}` : null,
+                primary?.format ? `Format: ${primary.format.toUpperCase()}` : null,
+                item.outputs.length > 1 ? `${item.outputs.length} outputs` : null,
+                hasInputs ? `${item.input_media!.length} input(s)` : null,
+              ]
+                .filter(Boolean)
+                .join(' · ');
+
               return (
                 <div
                   key={item.id}
@@ -323,6 +393,15 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                             muted
                             loop
                             playsInline
+                            preload="metadata"
+                            onLoadedMetadata={(e) => {
+                              const dur = e.currentTarget.duration;
+                              recordMeasuredMedia(primary.url, {
+                                width: e.currentTarget.videoWidth || null,
+                                height: e.currentTarget.videoHeight || null,
+                                durationSeconds: Number.isFinite(dur) && dur > 0 ? dur : null,
+                              });
+                            }}
                             onMouseEnter={(e) => {
                               void e.currentTarget.play().catch(() => {});
                             }}
@@ -336,6 +415,12 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                             src={primary.url}
                             alt={item.workflow_name}
                             referrerPolicy="no-referrer"
+                            onLoad={(e) => {
+                              recordMeasuredMedia(primary.url, {
+                                width: e.currentTarget.naturalWidth || null,
+                                height: e.currentTarget.naturalHeight || null,
+                              });
+                            }}
                             className="max-w-full max-h-full w-full h-full object-contain"
                           />
                         )
@@ -365,6 +450,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                               title: item.workflow_name,
                               filename: primary.original_filename || primary.filename,
                               mediaType: isVideo ? 'video' : 'image',
+                              width: primaryMeta?.width,
+                              height: primaryMeta?.height,
+                              durationSeconds: primaryMeta?.durationSeconds,
+                              fileSize: primaryMeta?.fileSize,
                             });
                           }}
                           title="Open original size"
@@ -406,13 +495,12 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                     </div>
 
                     <div className="flex items-center justify-between gap-2 pt-2 border-t border-zinc-800/60 text-[11px] font-mono text-zinc-400 tabular-nums">
-                      <span className="inline-flex items-center gap-1 shrink-0" title="Generation duration">
+                      <span className="inline-flex items-center gap-1 shrink-0" title="Generation time">
                         <Clock className="w-3 h-3 text-zinc-500" />
                         {formatDuration(item.duration_ms)}
                       </span>
-                      <span className="text-zinc-500 truncate">
-                        {item.outputs.length > 1 ? `${item.outputs.length} outputs` : primary?.format?.toUpperCase() || item.media_type.toUpperCase()}
-                        {hasInputs ? ` · ${item.input_media!.length} input${item.input_media!.length > 1 ? 's' : ''}` : ''}
+                      <span className="text-zinc-400 truncate" title={fullTooltip}>
+                        {rightSpecSummary}
                       </span>
                     </div>
                   </div>
@@ -469,7 +557,16 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                         loop
                         muted
                         playsInline
-                        className="max-w-full max-h-[64vh] object-contain"
+                        preload="metadata"
+                        onLoadedMetadata={(e) => {
+                          const dur = e.currentTarget.duration;
+                          recordMeasuredMedia(activeOutput.url, {
+                            width: e.currentTarget.videoWidth || null,
+                            height: e.currentTarget.videoHeight || null,
+                            durationSeconds: Number.isFinite(dur) && dur > 0 ? dur : null,
+                          });
+                        }}
+                        className="max-w-full max-h-[60vh] object-contain"
                       />
                     ) : (
                       <button
@@ -480,16 +577,26 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                             title: activeItem.workflow_name,
                             filename: activeOutput.original_filename || activeOutput.filename,
                             mediaType: 'image',
+                            width: activeOutputMeta?.width,
+                            height: activeOutputMeta?.height,
+                            durationSeconds: activeOutputMeta?.durationSeconds,
+                            fileSize: activeOutputMeta?.fileSize,
                           })
                         }
                         title="Click to view original size"
-                        className="flex items-center justify-center max-w-full max-h-[64vh] cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                        className="flex items-center justify-center max-w-full max-h-[60vh] cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                       >
                         <img
                           src={activeOutput.url}
                           alt={activeItem.workflow_name}
                           referrerPolicy="no-referrer"
-                          className="max-w-full max-h-[64vh] object-contain"
+                          onLoad={(e) => {
+                            recordMeasuredMedia(activeOutput.url, {
+                              width: e.currentTarget.naturalWidth || null,
+                              height: e.currentTarget.naturalHeight || null,
+                            });
+                          }}
+                          className="max-w-full max-h-[60vh] object-contain"
                         />
                       </button>
                     )
@@ -506,6 +613,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                           title: activeItem.workflow_name,
                           filename: activeOutput.original_filename || activeOutput.filename,
                           mediaType: activeOutput.media_type === 'video' ? 'video' : 'image',
+                          width: activeOutputMeta?.width,
+                          height: activeOutputMeta?.height,
+                          durationSeconds: activeOutputMeta?.durationSeconds,
+                          fileSize: activeOutputMeta?.fileSize,
                         })
                       }
                       className="absolute top-3 right-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md bg-black/80 hover:bg-blue-600 border border-zinc-700/80 hover:border-blue-500 text-zinc-200 hover:text-white transition-colors cursor-pointer"
@@ -516,22 +627,48 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                   )}
                 </div>
 
+                {activeOutput && (
+                  <div className="px-4 py-2 border-t border-zinc-800/80 bg-[#0B0D11] flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-zinc-400 tabular-nums shrink-0">
+                    <span className="truncate">
+                      {[
+                        activeOutput.format.toUpperCase(),
+                        activeOutputMeta?.dimensionsText,
+                        activeOutput.media_type === 'video' ? activeOutputMeta?.durationText : null,
+                        activeOutputMeta?.fileSizeText,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                    <span className="text-zinc-500 shrink-0">
+                      Gen {formatDuration(activeItem.duration_ms)}
+                    </span>
+                  </div>
+                )}
+
                 {activeItem.outputs.length > 1 && (
                   <div className="px-4 py-2.5 border-t border-zinc-800/80 bg-[#0B0D11] flex items-center gap-2 overflow-x-auto shrink-0">
-                    {activeItem.outputs.map((out, idx) => (
-                      <button
-                        key={out.filename}
-                        type="button"
-                        onClick={() => setSelectedOutputIndex(idx)}
-                        className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors shrink-0 cursor-pointer ${
-                          idx === selectedOutputIndex
-                            ? 'border-blue-500 bg-blue-600/15 text-blue-300'
-                            : 'border-zinc-800 bg-[#12151B] text-zinc-400 hover:text-zinc-200'
-                        }`}
-                      >
-                        Output {idx + 1}
-                      </button>
-                    ))}
+                    {activeItem.outputs.map((out, idx) => {
+                      const outMeta = resolveMediaMeta(out, measuredByUrl[out.url]);
+                      const tabDetail =
+                        out.media_type === 'video'
+                          ? outMeta.durationText || outMeta.dimensionsText
+                          : outMeta.dimensionsText;
+                      return (
+                        <button
+                          key={out.filename}
+                          type="button"
+                          onClick={() => setSelectedOutputIndex(idx)}
+                          className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded border transition-colors shrink-0 cursor-pointer ${
+                            idx === selectedOutputIndex
+                              ? 'border-blue-500 bg-blue-600/15 text-blue-300'
+                              : 'border-zinc-800 bg-[#12151B] text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          Output {idx + 1}
+                          {tabDetail ? ` · ${tabDetail}` : ''}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -552,22 +689,71 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                         Input Media ({activeItem.input_media.length})
                       </span>
                       <div className="space-y-2.5">
-                        {activeItem.input_media.map((inp) => (
-                          <div
-                            key={`${inp.key}-${inp.filename}`}
-                            className="rounded-md border border-zinc-800 bg-[#0B0D11] overflow-hidden"
-                          >
-                            <div className="relative h-40 w-full bg-[#07090C] flex items-center justify-center p-2">
-                              {inp.media_type === 'video' ? (
-                                <video
-                                  src={inp.url}
-                                  controls
-                                  muted
-                                  loop
-                                  playsInline
-                                  className="max-w-full max-h-full w-full h-full object-contain"
-                                />
-                              ) : (
+                        {activeItem.input_media.map((inp) => {
+                          const inpMeta = resolveMediaMeta(inp, measuredByUrl[inp.url]);
+                          const inpSpec = [
+                            inpMeta.dimensionsText,
+                            inp.media_type === 'video' ? inpMeta.durationText : null,
+                            inpMeta.fileSizeText,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ');
+                          return (
+                            <div
+                              key={`${inp.key}-${inp.filename}`}
+                              className="rounded-md border border-zinc-800 bg-[#0B0D11] overflow-hidden"
+                            >
+                              <div className="relative h-40 w-full bg-[#07090C] flex items-center justify-center p-2">
+                                {inp.media_type === 'video' ? (
+                                  <video
+                                    src={inp.url}
+                                    controls
+                                    muted
+                                    loop
+                                    playsInline
+                                    preload="metadata"
+                                    onLoadedMetadata={(e) => {
+                                      const dur = e.currentTarget.duration;
+                                      recordMeasuredMedia(inp.url, {
+                                        width: e.currentTarget.videoWidth || null,
+                                        height: e.currentTarget.videoHeight || null,
+                                        durationSeconds: Number.isFinite(dur) && dur > 0 ? dur : null,
+                                      });
+                                    }}
+                                    className="max-w-full max-h-full w-full h-full object-contain"
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      openOriginalLightbox({
+                                        url: inp.url,
+                                        title: inp.label || inp.field_name,
+                                        filename: inp.original_filename || inp.comfy_name,
+                                        mediaType: 'image',
+                                        width: inpMeta.width,
+                                        height: inpMeta.height,
+                                        durationSeconds: inpMeta.durationSeconds,
+                                        fileSize: inpMeta.fileSize,
+                                      })
+                                    }
+                                    title="Click to view original size"
+                                    className="w-full h-full flex items-center justify-center cursor-zoom-in"
+                                  >
+                                    <img
+                                      src={inp.url}
+                                      alt={inp.original_filename || inp.field_name}
+                                      referrerPolicy="no-referrer"
+                                      onLoad={(e) => {
+                                        recordMeasuredMedia(inp.url, {
+                                          width: e.currentTarget.naturalWidth || null,
+                                          height: e.currentTarget.naturalHeight || null,
+                                        });
+                                      }}
+                                      className="max-w-full max-h-full w-full h-full object-contain"
+                                    />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -575,46 +761,37 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                                       url: inp.url,
                                       title: inp.label || inp.field_name,
                                       filename: inp.original_filename || inp.comfy_name,
-                                      mediaType: 'image',
+                                      mediaType: inp.media_type === 'video' ? 'video' : 'image',
+                                      width: inpMeta.width,
+                                      height: inpMeta.height,
+                                      durationSeconds: inpMeta.durationSeconds,
+                                      fileSize: inpMeta.fileSize,
                                     })
                                   }
-                                  title="Click to view original size"
-                                  className="w-full h-full flex items-center justify-center cursor-zoom-in"
+                                  title="Open input in original size"
+                                  className="absolute top-2 right-2 p-1.5 rounded bg-black/75 hover:bg-blue-600 border border-zinc-700/60 text-zinc-200 hover:text-white transition-colors cursor-pointer"
                                 >
-                                  <img
-                                    src={inp.url}
-                                    alt={inp.original_filename || inp.field_name}
-                                    referrerPolicy="no-referrer"
-                                    className="max-w-full max-h-full w-full h-full object-contain"
-                                  />
+                                  <Maximize2 className="w-3.5 h-3.5" />
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  openOriginalLightbox({
-                                    url: inp.url,
-                                    title: inp.label || inp.field_name,
-                                    filename: inp.original_filename || inp.comfy_name,
-                                    mediaType: inp.media_type === 'video' ? 'video' : 'image',
-                                  })
-                                }
-                                title="Open input in original size"
-                                className="absolute top-2 right-2 p-1.5 rounded bg-black/75 hover:bg-blue-600 border border-zinc-700/60 text-zinc-200 hover:text-white transition-colors cursor-pointer"
-                              >
-                                <Maximize2 className="w-3.5 h-3.5" />
-                              </button>
+                              </div>
+                              <div className="px-3 py-2 border-t border-zinc-800/70 space-y-0.5 text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-zinc-300 font-medium truncate">
+                                    {inp.label || inp.field_name}
+                                  </span>
+                                  <span className="font-mono text-[11px] text-zinc-500 truncate">
+                                    {inp.original_filename}
+                                  </span>
+                                </div>
+                                {inpSpec && (
+                                  <div className="font-mono text-[11px] text-zinc-400 tabular-nums truncate">
+                                    {inpSpec}
+                                  </div>
+                                )}
+                              </div>
                             </div>
-                            <div className="px-3 py-2 border-t border-zinc-800/70 flex items-center justify-between gap-2 text-xs">
-                              <span className="text-zinc-300 font-medium truncate">
-                                {inp.label || inp.field_name}
-                              </span>
-                              <span className="font-mono text-[11px] text-zinc-500 truncate">
-                                {inp.original_filename}
-                              </span>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -695,7 +872,17 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               </span>
               {naturalSize && (
                 <span className="text-xs font-mono text-blue-400 tabular-nums shrink-0">
-                  {naturalSize.width} × {naturalSize.height}px
+                  {[
+                    `${naturalSize.width} × ${naturalSize.height} px`,
+                    lightboxMedia.mediaType === 'video'
+                      ? formatVideoDuration(
+                          naturalSize.durationSeconds ?? lightboxMedia.durationSeconds,
+                        )
+                      : null,
+                    formatFileSize(lightboxMedia.fileSize),
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
                 </span>
               )}
             </div>
@@ -762,10 +949,19 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                 autoPlay
                 loop
                 playsInline
+                preload="metadata"
                 onLoadedMetadata={(e) => {
+                  const dur = e.currentTarget.duration;
+                  const durSec = Number.isFinite(dur) && dur > 0 ? dur : null;
                   setNaturalSize({
                     width: e.currentTarget.videoWidth,
                     height: e.currentTarget.videoHeight,
+                    durationSeconds: durSec,
+                  });
+                  recordMeasuredMedia(lightboxMedia.url, {
+                    width: e.currentTarget.videoWidth || null,
+                    height: e.currentTarget.videoHeight || null,
+                    durationSeconds: durSec,
                   });
                 }}
                 onClick={(e) => e.stopPropagation()}
@@ -784,6 +980,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                   setNaturalSize({
                     width: e.currentTarget.naturalWidth,
                     height: e.currentTarget.naturalHeight,
+                  });
+                  recordMeasuredMedia(lightboxMedia.url, {
+                    width: e.currentTarget.naturalWidth || null,
+                    height: e.currentTarget.naturalHeight || null,
                   });
                 }}
                 onClick={(e) => e.stopPropagation()}

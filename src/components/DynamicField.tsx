@@ -1,5 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { Dices, Lock, Unlock, Upload, X, Film, Image as ImageIcon } from 'lucide-react';
+import {
+  formatDimensions,
+  formatFileSize,
+  formatVideoDuration,
+  type MeasuredMediaMeta,
+} from '../lib/mediaMeta.ts';
 import type { InputMediaInfo, UIInputField } from '../types/comfy.ts';
 
 interface DynamicFieldProps {
@@ -27,6 +33,7 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
 }) => {
   const [dragOver, setDragOver] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [measuredMeta, setMeasuredMeta] = useState<MeasuredMediaMeta | null>(null);
 
   useEffect(() => {
     if (!fileValue) {
@@ -67,6 +74,20 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
       : '';
   const legacyMediaName =
     !activePreviewUrl && typeof value === 'string' && value.trim() ? value.trim() : '';
+
+  useEffect(() => {
+    setMeasuredMeta(null);
+  }, [activePreviewUrl]);
+
+  const dimText = formatDimensions(
+    measuredMeta?.width ?? reusedMedia?.width,
+    measuredMeta?.height ?? reusedMedia?.height,
+  );
+  const durationText = activeIsVideo
+    ? formatVideoDuration(measuredMeta?.durationSeconds ?? reusedMedia?.duration_seconds)
+    : null;
+  const fileSizeText = formatFileSize(fileValue ? fileValue.size : reusedMedia?.file_size);
+  const mediaMetaParts = [dimText, durationText, fileSizeText].filter(Boolean) as string[];
 
   return (
     <div className="space-y-1.5">
@@ -239,27 +260,49 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
                   controls
                   muted
                   loop
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const dur = e.currentTarget.duration;
+                    setMeasuredMeta({
+                      width: e.currentTarget.videoWidth || null,
+                      height: e.currentTarget.videoHeight || null,
+                      durationSeconds: Number.isFinite(dur) && dur > 0 ? dur : null,
+                    });
+                  }}
                   className="w-full h-52 object-contain bg-black"
                 />
               ) : (
                 <img
                   src={activePreviewUrl}
                   alt={activeFileName || field.label}
+                  onLoad={(e) => {
+                    setMeasuredMeta({
+                      width: e.currentTarget.naturalWidth || null,
+                      height: e.currentTarget.naturalHeight || null,
+                    });
+                  }}
                   className="w-full h-52 object-contain bg-black/40"
                 />
               )}
               <div className="flex items-center justify-between px-3 py-2 border-t border-zinc-800 text-xs">
-                <span className="inline-flex items-center gap-1.5 text-zinc-300 truncate">
-                  {activeIsVideo ? (
-                    <Film className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                  ) : (
-                    <ImageIcon className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 text-zinc-300 min-w-0">
+                    {activeIsVideo ? (
+                      <Film className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                    ) : (
+                      <ImageIcon className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                    )}
+                    <span className="truncate">{activeFileName}</span>
+                    {!fileValue && reusedMedia && (
+                      <span className="text-[11px] font-mono text-blue-400 shrink-0">(reused)</span>
+                    )}
+                  </div>
+                  {mediaMetaParts.length > 0 && (
+                    <div className="text-[11px] font-mono text-zinc-400 tabular-nums truncate mt-0.5 pl-5">
+                      {mediaMetaParts.join(' · ')}
+                    </div>
                   )}
-                  <span className="truncate">{activeFileName}</span>
-                  {!fileValue && reusedMedia && (
-                    <span className="text-[11px] font-mono text-blue-400 shrink-0">(reused)</span>
-                  )}
-                </span>
+                </div>
                 <div className="flex items-center gap-3 shrink-0 ml-2">
                   <label
                     htmlFor={`field-${field.id}`}

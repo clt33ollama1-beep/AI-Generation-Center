@@ -14,6 +14,7 @@ from sqlmodel import Session
 
 from app.config import settings
 from app.database import engine
+from app.media_metadata import extract_media_metadata_from_file
 from app.models import GenerationRecord
 from app.schemas import InputMediaInfo, OutputFileInfo, QueueStatusResponse, QueueTaskItem
 
@@ -427,6 +428,9 @@ async def download_comfy_outputs(
                 rel_filename = f"{cat_dir}/{prompt_dir_seg}/{local_name}"
                 fmt = str(item.get("format") or ext.lstrip("."))
                 media_type = detect_media_type(orig_name, fmt)
+                media_meta = extract_media_metadata_from_file(
+                    local_path, media_type, cache_key=rel_filename
+                )
                 saved_outputs.append(
                     OutputFileInfo(
                         filename=rel_filename,
@@ -435,6 +439,10 @@ async def download_comfy_outputs(
                         media_type="video" if media_type == "video" else "image",
                         format=fmt,
                         node_id=str(node_id),
+                        width=media_meta.get("width"),
+                        height=media_meta.get("height"),
+                        duration_seconds=media_meta.get("duration_seconds"),
+                        file_size=media_meta.get("file_size"),
                     )
                 )
 
@@ -486,17 +494,25 @@ async def queue_and_track_generation(
             local_name = f"{field_slug}_{int(time.time() * 1000)}_{secrets.token_hex(3)}{ext}"
             local_path = inputs_dir / local_name
             local_path.write_bytes(item["content"])
+            rel_input_filename = f"{cat_dir}/{prompt_dir_seg}/inputs/{local_name}"
+            input_meta = extract_media_metadata_from_file(
+                local_path, media_type, cache_key=rel_input_filename
+            )
             saved_input_media.append(
                 InputMediaInfo(
                     key=str(item["key"]),
                     node_id=str(item["node_id"]),
                     field_name=str(item["field_name"]),
                     label=item.get("label"),
-                    filename=f"{cat_dir}/{prompt_dir_seg}/inputs/{local_name}",
+                    filename=rel_input_filename,
                     original_filename=orig_name,
                     comfy_name=str(item["comfy_name"]),
                     url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/inputs/{quote(local_name, safe='')}",
                     media_type=media_type,
+                    width=input_meta.get("width"),
+                    height=input_meta.get("height"),
+                    duration_seconds=input_meta.get("duration_seconds"),
+                    file_size=input_meta.get("file_size"),
                 )
             )
 
@@ -719,6 +735,7 @@ async def _watch_ws_until_done(
             progress_percent=100,
             current_node_id=None,
             current_node_title=None,
+            outputs=[o.model_dump() for o in outputs],
             finished_at=_utc_iso(),
             duration_ms=duration_ms,
         )

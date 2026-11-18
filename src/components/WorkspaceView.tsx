@@ -20,6 +20,13 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
+import {
+  formatDimensions,
+  formatFileSize,
+  formatVideoDuration,
+  resolveMediaMeta,
+  type MeasuredMediaMeta,
+} from '../lib/mediaMeta.ts';
 import type {
   Category,
   GenerationRecord,
@@ -128,7 +135,27 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [seedLocks, setSeedLocks] = useState<Record<string, boolean>>({});
   const [selectedOutputIndex, setSelectedOutputIndex] = useState(0);
   const [queuedFeedback, setQueuedFeedback] = useState<string | null>(null);
+  const [measuredByUrl, setMeasuredByUrl] = useState<Record<string, MeasuredMediaMeta>>({});
   const feedbackTimerRef = useRef<number | null>(null);
+
+  const recordMeasuredMedia = (url: string, meta: MeasuredMediaMeta) => {
+    if (!url) return;
+    setMeasuredByUrl((prev) => {
+      const existing = prev[url];
+      if (
+        existing &&
+        existing.width === meta.width &&
+        existing.height === meta.height &&
+        existing.durationSeconds === meta.durationSeconds
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [url]: { ...existing, ...meta },
+      };
+    });
+  };
 
   const safeCategories = Array.isArray(categories) ? categories : [];
   const safeWorkflows = Array.isArray(workflows) ? workflows : [];
@@ -370,6 +397,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   const currentOutput: OutputFileInfo | null =
     latestGeneration?.outputs?.[selectedOutputIndex] || null;
+  const currentOutputMeta = currentOutput
+    ? resolveMediaMeta(currentOutput, measuredByUrl[currentOutput.url])
+    : null;
 
   return (
     <div className="flex-1 flex min-h-0 overflow-hidden bg-[#0B0D11]">
@@ -790,8 +820,16 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                                 {task.status === 'running' &&
                                   `${task.progressPercent}% · ${task.elapsedSeconds}s`}
                                 {task.status === 'queued' && 'Queued'}
-                                {task.status === 'completed' &&
-                                  `${((task.generation?.duration_ms || 0) / 1000).toFixed(1)}s`}
+                                {task.status === 'completed' && (() => {
+                                  const firstOut = task.generation?.outputs?.[0];
+                                  const dims = formatDimensions(firstOut?.width, firstOut?.height);
+                                  const vidDur =
+                                    firstOut?.media_type === 'video'
+                                      ? formatVideoDuration(firstOut?.duration_seconds)
+                                      : null;
+                                  const genSec = `${((task.generation?.duration_ms || 0) / 1000).toFixed(1)}s`;
+                                  return [dims, vidDur, genSec].filter(Boolean).join(' · ');
+                                })()}
                                 {task.status === 'failed' && (
                                   <span className="text-red-400">Failed</span>
                                 )}
@@ -907,6 +945,15 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                     loop
                     muted
                     playsInline
+                    preload="metadata"
+                    onLoadedMetadata={(e) => {
+                      const dur = e.currentTarget.duration;
+                      recordMeasuredMedia(currentOutput.url, {
+                        width: e.currentTarget.videoWidth || null,
+                        height: e.currentTarget.videoHeight || null,
+                        durationSeconds: Number.isFinite(dur) && dur > 0 ? dur : null,
+                      });
+                    }}
                     className="max-w-full max-h-full object-contain"
                   />
                 ) : (
@@ -914,6 +961,12 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                     src={currentOutput.url}
                     alt={latestGeneration?.workflow_name || 'Generated output'}
                     referrerPolicy="no-referrer"
+                    onLoad={(e) => {
+                      recordMeasuredMedia(currentOutput.url, {
+                        width: e.currentTarget.naturalWidth || null,
+                        height: e.currentTarget.naturalHeight || null,
+                      });
+                    }}
                     className="max-w-full max-h-full object-contain"
                   />
                 )}
@@ -921,30 +974,42 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
               {latestGeneration && latestGeneration.outputs.length > 1 && (
                 <div className="flex items-center gap-2 overflow-x-auto pb-1">
-                  {latestGeneration.outputs.map((out, idx) => (
-                    <button
-                      key={out.filename}
-                      type="button"
-                      onClick={() => setSelectedOutputIndex(idx)}
-                      className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors shrink-0 cursor-pointer ${
-                        idx === selectedOutputIndex
-                          ? 'border-blue-500 bg-blue-600/15 text-blue-300'
-                          : 'border-zinc-800 bg-[#0B0D11] text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      Output {idx + 1}
-                    </button>
-                  ))}
+                  {latestGeneration.outputs.map((out, idx) => {
+                    const tabMeta = resolveMediaMeta(out, measuredByUrl[out.url]);
+                    const tabSpec =
+                      out.media_type === 'video'
+                        ? tabMeta.durationText || tabMeta.dimensionsText
+                        : tabMeta.dimensionsText;
+                    return (
+                      <button
+                        key={out.filename}
+                        type="button"
+                        onClick={() => setSelectedOutputIndex(idx)}
+                        className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded border transition-colors shrink-0 cursor-pointer ${
+                          idx === selectedOutputIndex
+                            ? 'border-blue-500 bg-blue-600/15 text-blue-300'
+                            : 'border-zinc-800 bg-[#0B0D11] text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        Output {idx + 1}
+                        {tabSpec ? ` · ${tabSpec}` : ''}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
 
-              <div className="flex items-center justify-between pt-2 border-t border-zinc-800/80 text-xs">
-                <div className="text-zinc-400 truncate space-x-2">
-                  <span className="font-mono text-zinc-300">{currentOutput.format.toUpperCase()}</span>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums">
-                    {((latestGeneration?.duration_ms || 0) / 1000).toFixed(1)}s
-                  </span>
+              <div className="flex items-center justify-between gap-3 pt-2 border-t border-zinc-800/80 text-xs">
+                <div className="text-zinc-400 truncate font-mono tabular-nums">
+                  {[
+                    currentOutput.format.toUpperCase(),
+                    currentOutputMeta?.dimensionsText,
+                    currentOutput.media_type === 'video' ? currentOutputMeta?.durationText : null,
+                    currentOutputMeta?.fileSizeText || formatFileSize(currentOutput.file_size),
+                    `Gen ${((latestGeneration?.duration_ms || 0) / 1000).toFixed(1)}s`,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
                 </div>
                 <a
                   href={currentOutput.url}

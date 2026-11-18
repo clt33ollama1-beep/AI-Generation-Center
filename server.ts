@@ -10,6 +10,7 @@ import multer from 'multer';
 import WebSocket from 'ws';
 import { createServer as createViteServer } from 'vite';
 import { normalizeComfyWorkflowPayload } from './server/comfyConverter.ts';
+import { extractMediaMetadataFromFile } from './server/mediaMetadata.ts';
 import { SEED_CATEGORIES, SEED_WORKFLOWS } from './server/seedData.ts';
 import type {
   ComfyApiWorkflow,
@@ -368,11 +369,39 @@ function mapWorkflowRow(row: Record<string, unknown>) {
   };
 }
 
+function enrichMediaEntry<T extends { filename?: string; media_type?: 'image' | 'video'; width?: number | null; height?: number | null; duration_seconds?: number | null; file_size?: number | null }>(
+  item: T,
+): T {
+  if (!item || !item.filename) return item;
+  const needsDims = item.width == null || item.height == null;
+  const needsDuration = item.media_type === 'video' && item.duration_seconds == null;
+  const needsSize = item.file_size == null;
+  if (!needsDims && !needsDuration && !needsSize) {
+    return item;
+  }
+  const safePath = resolveSafeOutputsPath(item.filename);
+  if (!safePath || !fs.existsSync(safePath)) {
+    return item;
+  }
+  const meta = extractMediaMetadataFromFile(safePath, item.media_type, item.filename);
+  return {
+    ...item,
+    width: item.width ?? meta.width,
+    height: item.height ?? meta.height,
+    duration_seconds: item.duration_seconds ?? meta.duration_seconds,
+    file_size: item.file_size ?? meta.file_size,
+  };
+}
+
 function mapGenerationRow(row: Record<string, unknown>): GenerationRecord {
   const parsedInputMedia = safeJsonParse<unknown>(row.input_media_json, []);
-  const inputMedia = Array.isArray(parsedInputMedia) ? (parsedInputMedia as InputMediaInfo[]) : [];
+  const inputMedia = Array.isArray(parsedInputMedia)
+    ? (parsedInputMedia as InputMediaInfo[]).map((m) => enrichMediaEntry(m))
+    : [];
   const parsedOutputs = safeJsonParse<unknown>(row.outputs_json, []);
-  const outputs = Array.isArray(parsedOutputs) ? (parsedOutputs as OutputFileInfo[]) : [];
+  const outputs = Array.isArray(parsedOutputs)
+    ? (parsedOutputs as OutputFileInfo[]).map((o) => enrichMediaEntry(o))
+    : [];
   const parsedSubmitted = safeJsonParse<unknown>(row.submitted_inputs_json, {});
   const submittedInputs =
     parsedSubmitted && typeof parsedSubmitted === 'object' && !Array.isArray(parsedSubmitted)
@@ -617,6 +646,7 @@ async function downloadComfyOutputs(
 
       const relFilename = `${catDir}/${promptDirSeg}/${localName}`;
       const mediaType = detectMediaTypeFromFilename(item.filename, item.format);
+      const mediaMeta = extractMediaMetadataFromFile(localPath, mediaType, relFilename);
       savedOutputs.push({
         filename: relFilename,
         original_filename: item.filename,
@@ -624,6 +654,10 @@ async function downloadComfyOutputs(
         media_type: mediaType,
         format: item.format || ext.replace('.', ''),
         node_id: nodeId,
+        width: mediaMeta.width,
+        height: mediaMeta.height,
+        duration_seconds: mediaMeta.duration_seconds,
+        file_size: mediaMeta.file_size,
       });
     }
   }
@@ -1474,16 +1508,22 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       const localName = `${baseSlug}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}${ext}`;
       const localPath = path.join(inputsTargetDir, localName);
       fs.writeFileSync(localPath, item.buffer);
+      const relInputName = `${catDir}/${promptDirSeg}/inputs/${localName}`;
+      const inputMeta = extractMediaMetadataFromFile(localPath, item.media_type, relInputName);
       savedInputMedia.push({
         key: item.key,
         node_id: item.node_id,
         field_name: item.field_name,
         label: item.label,
-        filename: `${catDir}/${promptDirSeg}/inputs/${localName}`,
+        filename: relInputName,
         original_filename: item.original_filename,
         comfy_name: item.comfy_name,
         url: buildOutputUrl(catDir, promptDirSeg, 'inputs', localName),
         media_type: item.media_type,
+        width: inputMeta.width,
+        height: inputMeta.height,
+        duration_seconds: inputMeta.duration_seconds,
+        file_size: inputMeta.file_size,
       });
     }
   }
@@ -1583,6 +1623,7 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
         progress_percent: 100,
         current_node_id: null,
         current_node_title: null,
+        outputs,
         finished_at: new Date().toISOString(),
         duration_ms: durationMs,
       });

@@ -32,6 +32,7 @@ from app.config import settings
 from app.converter import normalize_comfy_workflow_payload
 from app.database import engine, get_session, init_db
 from app.inspector import inspect_comfy_workflow
+from app.media_metadata import extract_media_metadata_from_file
 from app.models import (
     AppSetting,
     Category,
@@ -169,6 +170,32 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
     )
 
 
+def _enrich_media_dict(item: dict[str, Any]) -> dict[str, Any]:
+    filename = item.get("filename")
+    if not filename:
+        return item
+    media_type = item.get("media_type")
+    needs_dims = item.get("width") is None or item.get("height") is None
+    needs_dur = media_type == "video" and item.get("duration_seconds") is None
+    needs_size = item.get("file_size") is None
+    if not (needs_dims or needs_dur or needs_size):
+        return item
+    safe_path = resolve_safe_outputs_path(str(filename))
+    if not safe_path or not safe_path.exists():
+        return item
+    meta = extract_media_metadata_from_file(safe_path, media_type, cache_key=str(filename))
+    enriched = dict(item)
+    if enriched.get("width") is None:
+        enriched["width"] = meta.get("width")
+    if enriched.get("height") is None:
+        enriched["height"] = meta.get("height")
+    if enriched.get("duration_seconds") is None:
+        enriched["duration_seconds"] = meta.get("duration_seconds")
+    if enriched.get("file_size") is None:
+        enriched["file_size"] = meta.get("file_size")
+    return enriched
+
+
 def to_generation_read(rec: GenerationRecord) -> GenerationRead:
     outputs_raw = safe_json_loads(rec.outputs_json, [])
     if not isinstance(outputs_raw, list):
@@ -189,8 +216,8 @@ def to_generation_read(rec: GenerationRecord) -> GenerationRead:
         status=rec.status,  # type: ignore[arg-type]
         media_type=rec.media_type,  # type: ignore[arg-type]
         primary_output_url=rec.primary_output_url,
-        outputs=[OutputFileInfo(**o) for o in outputs_raw if isinstance(o, dict)],
-        input_media=[InputMediaInfo(**m) for m in input_media_raw if isinstance(m, dict)],
+        outputs=[OutputFileInfo(**_enrich_media_dict(o)) for o in outputs_raw if isinstance(o, dict)],
+        input_media=[InputMediaInfo(**_enrich_media_dict(m)) for m in input_media_raw if isinstance(m, dict)],
         submitted_inputs=submitted_raw,
         duration_ms=rec.duration_ms,
         error_message=rec.error_message,
