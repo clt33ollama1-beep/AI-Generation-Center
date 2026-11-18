@@ -80,6 +80,8 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     const cleanFieldLabel = input.field_name
       .replace(/_/g, ' ')
       .replace(/\b\w/g, (c) => c.toUpperCase());
+    const numDefault = typeof input.default_value === 'number' ? input.default_value : 0;
+    const isNumeric = input.value_type === 'int' || input.value_type === 'float';
     return {
       id: key,
       node_id: node.node_id,
@@ -89,9 +91,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       widget: input.suggested_widget,
       value_type: input.value_type,
       default_value: input.default_value,
-      min: input.value_type === 'int' || input.value_type === 'float' ? 0 : undefined,
-      max: input.value_type === 'int' || input.value_type === 'float' ? 100 : undefined,
-      step: input.value_type === 'float' ? 0.1 : 1,
+      min: input.suggested_widget === 'slider' ? Math.min(0, numDefault) : undefined,
+      max: input.suggested_widget === 'slider' ? Math.max(100, numDefault) : undefined,
+      step: isNumeric ? (input.value_type === 'float' ? 0.1 : 1) : undefined,
       options: input.suggested_widget === 'select' ? [String(input.default_value)] : undefined,
       order,
     };

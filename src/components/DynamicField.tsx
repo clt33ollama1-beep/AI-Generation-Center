@@ -97,13 +97,13 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
           min={field.min}
           max={field.max}
           step={field.step ?? (field.value_type === 'float' ? 0.1 : 1)}
-          onChange={(e) =>
-            onChange(
+          onChange={(e) => {
+            const parsed =
               field.value_type === 'int'
-                ? parseInt(e.target.value || '0', 10)
-                : parseFloat(e.target.value || '0'),
-            )
-          }
+                ? parseInt(e.target.value, 10)
+                : parseFloat(e.target.value);
+            onChange(Number.isNaN(parsed) ? 0 : parsed);
+          }}
           className={`${inputBaseClass} font-mono tabular-nums`}
         />
       )}
@@ -117,13 +117,13 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
             max={field.max ?? 100}
             step={field.step ?? (field.value_type === 'float' ? 0.1 : 1)}
             value={Number(value ?? field.min ?? 0)}
-            onChange={(e) =>
-              onChange(
+            onChange={(e) => {
+              const parsed =
                 field.value_type === 'int'
                   ? parseInt(e.target.value, 10)
-                  : parseFloat(e.target.value),
-              )
-            }
+                  : parseFloat(e.target.value);
+              onChange(Number.isNaN(parsed) ? 0 : parsed);
+            }}
             className="flex-1 accent-blue-500 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
           />
           <input
@@ -133,13 +133,13 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
             max={field.max}
             step={field.step ?? (field.value_type === 'float' ? 0.1 : 1)}
             value={Number(value ?? 0)}
-            onChange={(e) =>
-              onChange(
+            onChange={(e) => {
+              const parsed =
                 field.value_type === 'int'
-                  ? parseInt(e.target.value || '0', 10)
-                  : parseFloat(e.target.value || '0'),
-              )
-            }
+                  ? parseInt(e.target.value, 10)
+                  : parseFloat(e.target.value);
+              onChange(Number.isNaN(parsed) ? 0 : parsed);
+            }}
             className="w-20 px-2.5 py-1.5 text-xs font-mono tabular-nums bg-[#0B0D11] border border-zinc-800 rounded-md text-zinc-100 text-right focus:outline-none focus:border-blue-500"
           />
         </div>
@@ -151,7 +151,10 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
             id={`field-${field.id}`}
             type="number"
             value={Number(value ?? 0)}
-            onChange={(e) => onChange(parseInt(e.target.value || '0', 10))}
+            onChange={(e) => {
+              const parsed = parseInt(e.target.value, 10);
+              onChange(Number.isNaN(parsed) ? 0 : parsed);
+            }}
             className={`${inputBaseClass} font-mono tabular-nums flex-1`}
           />
           <button

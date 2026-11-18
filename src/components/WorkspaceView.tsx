@@ -68,6 +68,23 @@ function clearWorkflowDraft(workflowId: number): void {
   }
 }
 
+function generateClientId(): string {
+  if (typeof window !== 'undefined' && window.crypto) {
+    if (typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    if (typeof window.crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   categories,
   workflows,
@@ -178,18 +195,6 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     e.preventDefault();
     if (!activeWorkflow || isRunning) return;
 
-    // Auto-randomize unlocked seeds
-    const nextValues = { ...formValues };
-    for (const field of activeWorkflow.ui_inputs) {
-      const key = `${field.node_id}:${field.field_name}`;
-      if (field.widget === 'seed_randomizer' && !seedLocks[key]) {
-        nextValues[key] = Math.floor(Math.random() * 2_147_483_647);
-      }
-    }
-    setFormValues(nextValues);
-    saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks });
-
-    const clientId = crypto.randomUUID();
     setIsRunning(true);
     setRunError(null);
     setProgressPercent(0);
@@ -198,49 +203,62 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     setStatusMessage('Connecting to ComfyUI...');
     setElapsedSeconds(0);
 
-    if (timerRef.current) window.clearInterval(timerRef.current);
-    const startMs = Date.now();
-    timerRef.current = window.setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - startMs) / 1000));
-    }, 1000);
-
-    unsubscribeSseRef.current?.();
-    unsubscribeSseRef.current = api.subscribeProgress(
-      clientId,
-      (evt: ProgressEventPayload) => {
-        if (evt.type === 'status') {
-          setStatusMessage(evt.message || 'Queued on ComfyUI');
-        } else if (evt.type === 'executing') {
-          setActiveNodeLabel(evt.node_title || `Node ${evt.node_id}`);
-          setStatusMessage(`Running ${evt.node_title || evt.node_id}`);
-        } else if (evt.type === 'progress') {
-          if (typeof evt.value === 'number' && typeof evt.max === 'number') {
-            setStepProgress({ value: evt.value, max: evt.max });
-          }
-          if (typeof evt.percent === 'number') {
-            setProgressPercent(evt.percent);
-          }
-        } else if (evt.type === 'completed' && evt.generation) {
-          setIsRunning(false);
-          setProgressPercent(100);
-          setStatusMessage('Completed');
-          setActiveNodeLabel(null);
-          setLatestGeneration(evt.generation);
-          setSelectedOutputIndex(0);
-          onGenerationComplete(evt.generation);
-          if (timerRef.current) window.clearInterval(timerRef.current);
-          unsubscribeSseRef.current?.();
-        } else if (evt.type === 'error') {
-          setIsRunning(false);
-          setRunError(evt.message || 'Generation failed');
-          setStatusMessage('Failed');
-          if (timerRef.current) window.clearInterval(timerRef.current);
-          unsubscribeSseRef.current?.();
-        }
-      },
-    );
-
     try {
+      // Auto-randomize unlocked seeds
+      const nextValues = { ...formValues };
+      for (const field of activeWorkflow.ui_inputs) {
+        const key = `${field.node_id}:${field.field_name}`;
+        if (field.widget === 'seed_randomizer' && !seedLocks[key]) {
+          nextValues[key] = Math.floor(Math.random() * 2_147_483_647);
+        }
+      }
+      setFormValues(nextValues);
+      saveWorkflowDraft(activeWorkflow.id, { values: nextValues, seedLocks });
+
+      const clientId = generateClientId();
+
+      if (timerRef.current) window.clearInterval(timerRef.current);
+      const startMs = Date.now();
+      timerRef.current = window.setInterval(() => {
+        setElapsedSeconds(Math.floor((Date.now() - startMs) / 1000));
+      }, 1000);
+
+      unsubscribeSseRef.current?.();
+      unsubscribeSseRef.current = api.subscribeProgress(
+        clientId,
+        (evt: ProgressEventPayload) => {
+          if (evt.type === 'status') {
+            setStatusMessage(evt.message || 'Queued on ComfyUI');
+          } else if (evt.type === 'executing') {
+            setActiveNodeLabel(evt.node_title || `Node ${evt.node_id}`);
+            setStatusMessage(`Running ${evt.node_title || evt.node_id}`);
+          } else if (evt.type === 'progress') {
+            if (typeof evt.value === 'number' && typeof evt.max === 'number') {
+              setStepProgress({ value: evt.value, max: evt.max });
+            }
+            if (typeof evt.percent === 'number') {
+              setProgressPercent(evt.percent);
+            }
+          } else if (evt.type === 'completed' && evt.generation) {
+            setIsRunning(false);
+            setProgressPercent(100);
+            setStatusMessage('Completed');
+            setActiveNodeLabel(null);
+            setLatestGeneration(evt.generation);
+            setSelectedOutputIndex(0);
+            onGenerationComplete(evt.generation);
+            if (timerRef.current) window.clearInterval(timerRef.current);
+            unsubscribeSseRef.current?.();
+          } else if (evt.type === 'error') {
+            setIsRunning(false);
+            setRunError(evt.message || 'Generation failed');
+            setStatusMessage('Failed');
+            if (timerRef.current) window.clearInterval(timerRef.current);
+            unsubscribeSseRef.current?.();
+          }
+        },
+      );
+
       const formData = new FormData();
       formData.append('workflow_id', String(activeWorkflow.id));
       formData.append('client_id', clientId);
@@ -383,7 +401,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
             </button>
           </div>
         ) : (
-          <form onSubmit={handleGenerate} className="p-6 max-w-2xl mx-auto space-y-6">
+          <form onSubmit={handleGenerate} noValidate className="p-6 max-w-2xl mx-auto space-y-6">
             <div className="pb-4 border-b border-zinc-800/80 space-y-1.5">
               <div className="flex items-center gap-2 text-xs text-zinc-400">
                 <span>{activeWorkflow.category_name}</span>
