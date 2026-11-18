@@ -6,7 +6,6 @@ import { ConnectionModal } from './components/ConnectionModal.tsx';
 import { WorkspaceView } from './components/WorkspaceView.tsx';
 import { TemplatesView } from './components/TemplatesView.tsx';
 import { GalleryView } from './components/GalleryView.tsx';
-import { useGenerationQueue } from './hooks/useGenerationQueue.ts';
 
 function getInitialRoute(): AppRoute {
   const path = window.location.pathname;
@@ -39,12 +38,6 @@ export default function App() {
   const [createTemplateTrigger, setCreateTemplateTrigger] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-
-  const handleGenerationComplete = useCallback((gen: GenerationRecord) => {
-    setGenerations((prev) => [gen, ...prev]);
-  }, []);
-
-  const queue = useGenerationQueue(handleGenerationComplete);
 
   const navigate = useCallback((nextRoute: AppRoute) => {
     setRoute(nextRoute);
@@ -195,21 +188,10 @@ export default function App() {
               }}
               onClearPrefilled={() => setPrefilledGeneration(null)}
               onOpenConnection={() => setConnectionOpen(true)}
+              onGenerationComplete={(gen) => {
+                setGenerations((prev) => [gen, ...prev]);
+              }}
               onGoTemplates={handleNewTemplate}
-              queueTasks={queue.tasks}
-              isQueueRunning={queue.isQueueRunning}
-              selectedOutputTaskId={queue.selectedOutputTaskId}
-              onSelectOutputTask={queue.setSelectedOutputTaskId}
-              onEnqueueTask={queue.enqueueTask}
-              onStartQueue={queue.startQueue}
-              onPauseQueue={queue.pauseQueue}
-              onRunTaskNow={queue.runTaskNow}
-              onMoveTaskUp={queue.moveTaskUp}
-              onCancelTask={queue.cancelTask}
-              onRetryTask={queue.retryTask}
-              onRequeueTask={queue.requeueTask}
-              onRemoveTask={queue.removeTask}
-              onClearFinishedTasks={queue.clearFinished}
             />
           )}
 
