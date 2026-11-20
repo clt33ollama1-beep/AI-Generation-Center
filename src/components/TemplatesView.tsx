@@ -162,7 +162,13 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   }, [createModeTrigger]);
 
   useEffect(() => {
-    if (!categoryId && categories.length > 0) {
+    if (categories.length === 0) {
+      if (categoryId !== 0) {
+        setCategoryId(0);
+      }
+      return;
+    }
+    if (!categories.some((c) => c.id === categoryId)) {
       setCategoryId(categories[0].id);
     }
   }, [categories, categoryId]);
@@ -171,7 +177,10 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     setEditingId(wf.id);
     setName(wf.name);
     setDescription(wf.description);
-    setCategoryId(wf.category_id);
+    const validCategoryId = categories.some((c) => c.id === wf.category_id)
+      ? wf.category_id
+      : categories[0]?.id || 0;
+    setCategoryId(validCategoryId);
     setOutputType(wf.output_type);
     setOutputNodeIds(wf.output_node_ids || []);
     setParsedWorkflow(wf.comfy_api_json);
@@ -308,8 +317,8 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       setError('Template name is required');
       return;
     }
-    if (!categoryId) {
-      setError('Select or create a category');
+    if (!categoryId || !categories.some((c) => c.id === categoryId)) {
+      setError('Select or create a valid category');
       return;
     }
     if (!parsedWorkflow) {
@@ -1083,9 +1092,11 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                       const raw = e.target.value;
                                       let val: string | number | boolean = raw;
                                       if (mapped.value_type === 'int') {
-                                        val = parseInt(raw || '0', 10);
+                                        const parsed = parseInt(raw || '0', 10);
+                                        val = Number.isFinite(parsed) ? parsed : 0;
                                       } else if (mapped.value_type === 'float') {
-                                        val = parseFloat(raw || '0');
+                                        const parsed = parseFloat(raw || '0');
+                                        val = Number.isFinite(parsed) ? parsed : 0;
                                       } else if (mapped.value_type === 'boolean') {
                                         val = raw === 'true';
                                       }
@@ -1102,11 +1113,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                   <input
                                     type="number"
                                     value={mapped.order}
-                                    onChange={(e) =>
+                                    onChange={(e) => {
+                                      const parsed = parseInt(e.target.value || '1', 10);
                                       updateMappedField(key, {
-                                        order: parseInt(e.target.value || '1', 10),
-                                      })
-                                    }
+                                        order: Number.isFinite(parsed) ? parsed : 1,
+                                      });
+                                    }}
                                     className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
                                   />
                                 </div>
@@ -1121,11 +1133,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                         type="number"
                                         step="any"
                                         value={mapped.min ?? 0}
-                                        onChange={(e) =>
+                                        onChange={(e) => {
+                                          const parsed = parseFloat(e.target.value || '0');
                                           updateMappedField(key, {
-                                            min: parseFloat(e.target.value || '0'),
-                                          })
-                                        }
+                                            min: Number.isFinite(parsed) ? parsed : 0,
+                                          });
+                                        }}
                                         className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100"
                                       />
                                     </div>
@@ -1137,11 +1150,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                         type="number"
                                         step="any"
                                         value={mapped.max ?? 100}
-                                        onChange={(e) =>
+                                        onChange={(e) => {
+                                          const parsed = parseFloat(e.target.value || '100');
                                           updateMappedField(key, {
-                                            max: parseFloat(e.target.value || '100'),
-                                          })
-                                        }
+                                            max: Number.isFinite(parsed) ? parsed : 100,
+                                          });
+                                        }}
                                         className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100"
                                       />
                                     </div>
@@ -1153,11 +1167,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                         type="number"
                                         step="any"
                                         value={mapped.step ?? 1}
-                                        onChange={(e) =>
+                                        onChange={(e) => {
+                                          const parsed = parseFloat(e.target.value || '1');
                                           updateMappedField(key, {
-                                            step: parseFloat(e.target.value || '1'),
-                                          })
-                                        }
+                                            step: Number.isFinite(parsed) ? parsed : 1,
+                                          });
+                                        }}
                                         className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100"
                                       />
                                     </div>

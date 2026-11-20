@@ -80,7 +80,8 @@ def _classify_output_node(
     node_id: str, node: dict[str, Any], is_primary_app_output: bool
 ) -> dict[str, Any]:
     class_type = str(node.get("class_type", ""))
-    inputs = node.get("inputs") or {}
+    raw_inputs = node.get("inputs")
+    inputs = raw_inputs if isinstance(raw_inputs, dict) else {}
     raw_format = inputs.get("format") if isinstance(inputs.get("format"), str) else ""
     fmt_lower = raw_format.lower()
 
@@ -134,7 +135,10 @@ def extract_workflow_outputs(
             seen.add(node_id)
 
     def sort_key(nid: str) -> tuple[int, str]:
-        return (0, f"{int(nid):010d}") if nid.isdigit() else (1, nid)
+        try:
+            return (0, f"{int(nid):010d}")
+        except ValueError:
+            return (1, nid)
 
     for node_id in sorted(api_workflow.keys(), key=sort_key):
         if node_id in seen:
@@ -182,20 +186,32 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
         if isinstance(node, dict) and node.get("id") is not None:
             nodes_by_id[str(node["id"])] = node
 
+    def _safe_int(val: Any) -> int | None:
+        if isinstance(val, bool) or val is None:
+            return None
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
     links_by_id: dict[int, list[Any]] = {}
     for link in raw_links:
         if isinstance(link, list) and len(link) >= 5:
-            links_by_id[int(link[0])] = link
+            lid = _safe_int(link[0])
+            if lid is not None:
+                links_by_id[lid] = link
 
     set_node_links: dict[str, int] = {}
     for node in raw_nodes:
         if isinstance(node, dict) and node.get("type") == "SetNode" and node.get("mode", 0) != 2:
             const_name = _get_set_get_constant_name(node)
             for inp in node.get("inputs") or []:
-                if isinstance(inp, dict) and inp.get("link") is not None:
-                    if const_name:
-                        set_node_links[const_name] = int(inp["link"])
-                    break
+                if isinstance(inp, dict):
+                    lid = _safe_int(inp.get("link"))
+                    if lid is not None:
+                        if const_name:
+                            set_node_links[const_name] = lid
+                        break
 
     def resolve_link_origin(
         link_id: int, visited: set[str] | None = None
@@ -207,7 +223,9 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
             return None
 
         origin_node_id = str(link[1])
-        origin_slot = int(link[2])
+        origin_slot = _safe_int(link[2])
+        if origin_slot is None:
+            return None
         link_type = link[5] if len(link) > 5 and isinstance(link[5], str) else "*"
         visit_key = f"{origin_node_id}:{origin_slot}"
         if visit_key in visited:
@@ -225,8 +243,10 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
         node_type = origin_node.get("type")
         if node_type in {"Reroute", "SetNode"}:
             for inp in origin_node.get("inputs") or []:
-                if isinstance(inp, dict) and inp.get("link") is not None:
-                    return resolve_link_origin(int(inp["link"]), next_visited)
+                if isinstance(inp, dict):
+                    lid = _safe_int(inp.get("link"))
+                    if lid is not None:
+                        return resolve_link_origin(lid, next_visited)
             return None
 
         if node_type == "GetNode":
@@ -268,9 +288,10 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
                 None,
             )
             chosen = exact or (connected[0] if len(connected) == 1 else None)
-            if not chosen or chosen.get("link") is None:
+            chosen_lid = _safe_int(chosen.get("link")) if chosen else None
+            if chosen_lid is None:
                 return None
-            return resolve_link_origin(int(chosen["link"]), next_visited)
+            return resolve_link_origin(chosen_lid, next_visited)
 
         return ("link", [origin_node_id, origin_slot])
 
@@ -296,19 +317,22 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
         for inp in node.get("inputs") or []:
             if not isinstance(inp, dict):
                 continue
-            link_val = inp.get("link")
-            if link_val is not None:
+            inp_name = inp.get("name")
+            if not isinstance(inp_name, str) or not inp_name:
+                continue
+            lid = _safe_int(inp.get("link"))
+            if lid is not None:
                 linked_input_count += 1
-                resolved = resolve_link_origin(int(link_val))
+                resolved = resolve_link_origin(lid)
                 if resolved is not None:
                     resolved_link_count += 1
-                    api_inputs[inp["name"]] = resolved[1]
+                    api_inputs[inp_name] = resolved[1]
 
         named = node.get("widgets_values_named")
         wv = node.get("widgets_values")
         if isinstance(named, dict):
             for key, val in named.items():
-                if key in FRONTEND_WIDGET_KEYS or key.startswith("divider"):
+                if key in FRONTEND_WIDGET_KEYS or str(key).startswith("divider"):
                     continue
                 if key not in api_inputs:
                     api_inputs[key] = val
@@ -317,6 +341,8 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
                 inp
                 for inp in (node.get("inputs") or [])
                 if isinstance(inp, dict)
+                and isinstance(inp.get("name"), str)
+                and inp.get("name")
                 and isinstance(inp.get("widget"), dict)
                 and inp["widget"].get("name")
             ]
@@ -326,10 +352,11 @@ def convert_comfy_graph_to_api(graph: dict[str, Any]) -> dict[str, Any]:
                     break
                 val = wv[w_idx]
                 w_idx += 1
-                if inp["name"] not in api_inputs:
-                    api_inputs[inp["name"]] = val
+                inp_name = inp["name"]
+                if inp_name not in api_inputs:
+                    api_inputs[inp_name] = val
                 if (
-                    inp["name"] in {"seed", "noise_seed"}
+                    inp_name in {"seed", "noise_seed"}
                     and w_idx < len(wv)
                     and isinstance(wv[w_idx], str)
                     and wv[w_idx] in SEED_CONTROL_VALUES

@@ -155,13 +155,15 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
                 parsed_ui_inputs.append(UIInputField(**item))
             except Exception:
                 continue
+    raw_output_type = (wf.output_type or "auto").strip().lower()
+    safe_output_type = raw_output_type if raw_output_type in {"auto", "image", "video"} else "auto"
     return WorkflowRead(
         id=wf.id or 0,
         name=wf.name,
         description=wf.description or "",
         category_id=wf.category_id,
         category_name=category_name or "Uncategorized",
-        output_type=wf.output_type,  # type: ignore[arg-type]
+        output_type=safe_output_type,  # type: ignore[arg-type]
         output_node_ids=output_node_ids,
         comfy_api_json=comfy_api_raw,
         ui_inputs=parsed_ui_inputs,
@@ -343,16 +345,23 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
         )
 
     uncat_id: Optional[int] = None
-    if wf_count > 0 or total_categories <= 1:
-        uncat_id = get_or_create_uncategorized_category_id(session)
-        for wf in affected_workflows:
-            wf.category_id = uncat_id
-            wf.updated_at = utcnow_iso()
-            session.add(wf)
-        session.flush()
+    try:
+        if wf_count > 0 or total_categories <= 1:
+            uncat_id = get_or_create_uncategorized_category_id(session)
+            for wf in affected_workflows:
+                wf.category_id = uncat_id
+                wf.updated_at = utcnow_iso()
+                session.add(wf)
+            session.flush()
 
-    session.delete(cat)
-    session.commit()
+        session.delete(cat)
+        session.commit()
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "deleted": True,
         "reassigned_count": wf_count,
@@ -362,8 +371,13 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
 
 @app.post("/api/workflows/inspect", response_model=WorkflowInspectResponse)
 def inspect_workflow(payload: WorkflowInspectRequest):
-    normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
-    nodes = inspect_comfy_workflow(normalized["workflow"])
+    try:
+        normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+        nodes = inspect_comfy_workflow(normalized["workflow"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid ComfyUI workflow JSON: {exc}"
+        ) from exc
     return WorkflowInspectResponse(
         nodes=nodes,
         outputs=normalized["outputs"],
@@ -395,17 +409,28 @@ def get_workflow(workflow_id: int, session: Session = Depends(get_session)):
 
 @app.post("/api/workflows", response_model=WorkflowRead, status_code=201)
 def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_session)):
+    cleaned_name = payload.name.strip()
+    if not cleaned_name:
+        raise HTTPException(status_code=400, detail="Template name is required")
     cat = session.get(Category, payload.category_id)
     if not cat:
-        raise HTTPException(status_code=404, detail="Category not found")
-    normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+        raise HTTPException(
+            status_code=404,
+            detail="Selected category was not found. Please select an existing category.",
+        )
+    try:
+        normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid ComfyUI workflow JSON: {exc}"
+        ) from exc
     output_node_ids = (
         [str(x) for x in payload.output_node_ids]
         if payload.output_node_ids is not None
         else normalized["suggested_output_node_ids"]
     )
     wf = WorkflowTemplate(
-        name=payload.name.strip(),
+        name=cleaned_name,
         description=payload.description.strip(),
         category_id=payload.category_id,
         output_type=payload.output_type or normalized["suggested_output_type"],
@@ -414,8 +439,12 @@ def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_sess
         ui_inputs_json=json.dumps([item.model_dump() for item in payload.ui_inputs]),
     )
     session.add(wf)
-    session.commit()
-    session.refresh(wf)
+    try:
+        session.commit()
+        session.refresh(wf)
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return to_workflow_read(wf, cat.name)
 
 
@@ -429,18 +458,30 @@ def update_workflow(
     if not wf:
         raise HTTPException(status_code=404, detail="Workflow template not found")
     if payload.name is not None:
-        wf.name = payload.name.strip()
+        cleaned_name = payload.name.strip()
+        if not cleaned_name:
+            raise HTTPException(status_code=400, detail="Template name is required")
+        wf.name = cleaned_name
     if payload.description is not None:
         wf.description = payload.description.strip()
     if payload.category_id is not None:
+        target_cat = session.get(Category, payload.category_id)
+        if not target_cat:
+            raise HTTPException(
+                status_code=404,
+                detail="Selected category was not found. Please refresh and choose a valid category.",
+            )
         wf.category_id = payload.category_id
     if payload.output_type is not None:
         wf.output_type = payload.output_type
-    normalized = (
-        normalize_comfy_workflow_payload(payload.comfy_api_json)
-        if payload.comfy_api_json is not None
-        else None
-    )
+    normalized = None
+    if payload.comfy_api_json is not None:
+        try:
+            normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid ComfyUI workflow JSON: {exc}"
+            ) from exc
     if normalized is not None:
         wf.comfy_api_json = json.dumps(normalized["workflow"])
     if payload.output_node_ids is not None:
@@ -455,8 +496,12 @@ def update_workflow(
         wf.ui_inputs_json = json.dumps([item.model_dump() for item in payload.ui_inputs])
     wf.updated_at = utcnow_iso()
     session.add(wf)
-    session.commit()
-    session.refresh(wf)
+    try:
+        session.commit()
+        session.refresh(wf)
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     cat = session.get(Category, wf.category_id)
     return to_workflow_read(wf, cat.name if cat else "Uncategorized")
 

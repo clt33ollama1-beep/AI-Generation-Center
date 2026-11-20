@@ -102,6 +102,9 @@ def inspect_comfy_workflow(workflow: dict[str, Any]) -> list[InspectedNode]:
             )
 
     def sort_key(n: InspectedNode) -> tuple[int, str]:
-        return (0, f"{int(n.node_id):010d}") if n.node_id.isdigit() else (1, n.node_id)
+        try:
+            return (0, f"{int(n.node_id):010d}")
+        except ValueError:
+            return (1, n.node_id)
 
     return sorted(inspected_nodes, key=sort_key)

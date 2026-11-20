@@ -142,7 +142,8 @@ function classifyOutputNode(
   node: ComfyNode,
   isPrimaryAppOutput: boolean,
 ): InspectedOutput {
-  const inputs = node.inputs || {};
+  const inputs =
+    node.inputs && typeof node.inputs === 'object' && !Array.isArray(node.inputs) ? node.inputs : {};
   const rawFormat = typeof inputs.format === 'string' ? inputs.format : '';
   const fmtLower = rawFormat.toLowerCase();
 
@@ -367,7 +368,8 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
     let resolvedLinkCount = 0;
 
     for (const inp of node.inputs || []) {
-      if (inp.link !== null && inp.link !== undefined) {
+      if (!inp || typeof inp !== 'object' || typeof inp.name !== 'string' || !inp.name) continue;
+      if (inp.link !== null && inp.link !== undefined && Number.isFinite(Number(inp.link))) {
         linkedInputCount++;
         const resolved = resolveLinkOrigin(Number(inp.link));
         if (resolved) {
@@ -392,7 +394,9 @@ export function convertComfyGraphToApi(graph: ComfyGraphWorkflow): {
         }
       }
     } else if (Array.isArray(node.widgets_values)) {
-      const widgetInputs = (node.inputs || []).filter((inp) => inp.widget && inp.widget.name);
+      const widgetInputs = (node.inputs || []).filter(
+        (inp) => inp && typeof inp === 'object' && typeof inp.name === 'string' && inp.name && inp.widget && inp.widget.name,
+      );
       let wIdx = 0;
       for (const inp of widgetInputs) {
         if (wIdx >= node.widgets_values.length) break;

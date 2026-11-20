@@ -802,6 +802,10 @@ app.put('/api/categories/:id', (req: Request, res: Response) => {
 
 app.delete('/api/categories/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ detail: 'Invalid category id' });
+    return;
+  }
   const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as
     | { id: number; name: string; slug: string }
     | undefined;
@@ -829,23 +833,29 @@ app.delete('/api/categories/:id', (req: Request, res: Response) => {
     return;
   }
 
-  let uncategorizedId: number | null = null;
-  if (wfCount > 0 || Number(totalCatRow?.count || 0) <= 1) {
-    uncategorizedId = getOrCreateUncategorizedCategoryId();
-    if (wfCount > 0) {
-      db.prepare("UPDATE workflows SET category_id = ?, updated_at = datetime('now') WHERE category_id = ?").run(
-        uncategorizedId,
-        id,
-      );
+  try {
+    let uncategorizedId: number | null = null;
+    if (wfCount > 0 || Number(totalCatRow?.count || 0) <= 1) {
+      uncategorizedId = getOrCreateUncategorizedCategoryId();
+      if (wfCount > 0) {
+        db.prepare("UPDATE workflows SET category_id = ?, updated_at = datetime('now') WHERE category_id = ?").run(
+          uncategorizedId,
+          id,
+        );
+      }
     }
-  }
 
-  db.prepare('DELETE FROM categories WHERE id = ?').run(id);
-  res.json({
-    deleted: true,
-    reassigned_count: wfCount,
-    uncategorized_category_id: uncategorizedId,
-  });
+    db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+    res.json({
+      deleted: true,
+      reassigned_count: wfCount,
+      uncategorized_category_id: uncategorizedId,
+    });
+  } catch (err) {
+    res.status(409).json({
+      detail: err instanceof Error ? err.message : 'Failed to delete category',
+    });
+  }
 });
 
 // Workflow Inspector
@@ -855,19 +865,25 @@ app.post('/api/workflows/inspect', (req: Request, res: Response) => {
     res.status(400).json({ detail: 'comfy_api_json must be a ComfyUI API or workflow JSON object' });
     return;
   }
-  const normalized = normalizeComfyWorkflowPayload(workflowJson);
-  const nodes = inspectComfyWorkflow(normalized.workflow);
-  res.json({
-    nodes,
-    outputs: normalized.outputs,
-    app_inputs: normalized.app_inputs,
-    source_format: normalized.source_format,
-    converted_api_json: normalized.workflow,
-    suggested_field_keys: normalized.suggested_field_keys,
-    suggested_output_type: normalized.suggested_output_type,
-    suggested_output_node_ids: normalized.suggested_output_node_ids,
-    conversion_stats: normalized.conversion_stats ?? null,
-  });
+  try {
+    const normalized = normalizeComfyWorkflowPayload(workflowJson);
+    const nodes = inspectComfyWorkflow(normalized.workflow);
+    res.json({
+      nodes,
+      outputs: normalized.outputs,
+      app_inputs: normalized.app_inputs,
+      source_format: normalized.source_format,
+      converted_api_json: normalized.workflow,
+      suggested_field_keys: normalized.suggested_field_keys,
+      suggested_output_type: normalized.suggested_output_type,
+      suggested_output_node_ids: normalized.suggested_output_node_ids,
+      conversion_stats: normalized.conversion_stats ?? null,
+    });
+  } catch (err) {
+    res.status(400).json({
+      detail: err instanceof Error ? `Invalid ComfyUI workflow JSON: ${err.message}` : 'Invalid ComfyUI workflow JSON',
+    });
+  }
 });
 
 // Workflows CRUD
@@ -907,85 +923,141 @@ app.post('/api/workflows', (req: Request, res: Response) => {
   const comfyApiJson = req.body?.comfy_api_json;
   const uiInputs = Array.isArray(req.body?.ui_inputs) ? req.body.ui_inputs : [];
 
-  if (!name || !categoryId || !comfyApiJson) {
-    res.status(400).json({ detail: 'name, category_id, and comfy_api_json are required' });
+  if (!name || !Number.isInteger(categoryId) || categoryId <= 0 || !comfyApiJson || typeof comfyApiJson !== 'object' || Array.isArray(comfyApiJson)) {
+    res.status(400).json({ detail: 'name, a valid category_id, and comfy_api_json are required' });
     return;
   }
 
-  const normalized = normalizeComfyWorkflowPayload(comfyApiJson);
-  const outputType = String(req.body?.output_type || normalized.suggested_output_type || 'auto');
-  const outputNodeIds = Array.isArray(req.body?.output_node_ids)
-    ? req.body.output_node_ids.map((id: unknown) => String(id))
-    : normalized.suggested_output_node_ids;
+  const categoryExists = db.prepare('SELECT id FROM categories WHERE id = ?').get(categoryId);
+  if (!categoryExists) {
+    res.status(404).json({ detail: 'Selected category was not found. Please select an existing category.' });
+    return;
+  }
 
-  const result = db
-    .prepare(`
-      INSERT INTO workflows (name, description, category_id, output_type, output_node_ids_json, comfy_api_json, ui_inputs_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      name,
-      description,
-      categoryId,
-      outputType,
-      JSON.stringify(outputNodeIds),
-      JSON.stringify(normalized.workflow),
-      JSON.stringify(uiInputs),
-    );
+  try {
+    const normalized = normalizeComfyWorkflowPayload(comfyApiJson);
+    const rawOutputType = String(req.body?.output_type || normalized.suggested_output_type || 'auto').trim().toLowerCase();
+    const outputType = ['auto', 'image', 'video'].includes(rawOutputType) ? rawOutputType : 'auto';
+    const outputNodeIds = Array.isArray(req.body?.output_node_ids)
+      ? req.body.output_node_ids.map((id: unknown) => String(id))
+      : normalized.suggested_output_node_ids;
 
-  const created = db
-    .prepare(`
-      SELECT w.*, c.name AS category_name
-      FROM workflows w
-      JOIN categories c ON c.id = w.category_id
-      WHERE w.id = ?
-    `)
-    .get(Number(result.lastInsertRowid));
-  res.status(201).json(mapWorkflowRow(created!));
+    const result = db
+      .prepare(`
+        INSERT INTO workflows (name, description, category_id, output_type, output_node_ids_json, comfy_api_json, ui_inputs_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        name,
+        description,
+        categoryId,
+        outputType,
+        JSON.stringify(outputNodeIds),
+        JSON.stringify(normalized.workflow),
+        JSON.stringify(uiInputs),
+      );
+
+    const created = db
+      .prepare(`
+        SELECT w.*, COALESCE(c.name, 'Uncategorized') AS category_name
+        FROM workflows w
+        LEFT JOIN categories c ON c.id = w.category_id
+        WHERE w.id = ?
+      `)
+      .get(Number(result.lastInsertRowid));
+    if (!created) {
+      res.status(500).json({ detail: 'Failed to retrieve created workflow template' });
+      return;
+    }
+    res.status(201).json(mapWorkflowRow(created));
+  } catch (err) {
+    res.status(400).json({
+      detail: err instanceof Error ? err.message : 'Failed to create workflow template',
+    });
+  }
 });
 
 app.put('/api/workflows/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM workflows WHERE id = ?').get(id);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ detail: 'Invalid workflow template id' });
+    return;
+  }
+  const existing = db.prepare('SELECT * FROM workflows WHERE id = ?').get(id) as
+    | Record<string, unknown>
+    | undefined;
   if (!existing) {
     res.status(404).json({ detail: 'Workflow template not found' });
     return;
   }
 
   const name = String(req.body?.name ?? existing.name).trim();
-  const description = String(req.body?.description ?? existing.description).trim();
-  const categoryId = Number(req.body?.category_id ?? existing.category_id);
-  const outputType = String(req.body?.output_type ?? existing.output_type);
-  const normalized = req.body?.comfy_api_json
-    ? normalizeComfyWorkflowPayload(req.body.comfy_api_json)
-    : null;
-  const comfyApiJson = normalized
-    ? JSON.stringify(normalized.workflow)
-    : String(existing.comfy_api_json);
-  const outputNodeIdsJson = Array.isArray(req.body?.output_node_ids)
-    ? JSON.stringify(req.body.output_node_ids.map((nid: unknown) => String(nid)))
-    : normalized && normalized.suggested_output_node_ids.length > 0 && String(existing.output_node_ids_json || '[]') === '[]'
-      ? JSON.stringify(normalized.suggested_output_node_ids)
-      : String(existing.output_node_ids_json || '[]');
-  const uiInputsJson = req.body?.ui_inputs
-    ? JSON.stringify(req.body.ui_inputs)
-    : String(existing.ui_inputs_json);
+  if (!name) {
+    res.status(400).json({ detail: 'Template name is required' });
+    return;
+  }
+  const description = String(req.body?.description ?? existing.description ?? '').trim();
+  const rawCategoryId =
+    req.body?.category_id !== undefined && req.body?.category_id !== null && req.body?.category_id !== ''
+      ? req.body.category_id
+      : existing.category_id;
+  const categoryId = Number(rawCategoryId);
+  if (!Number.isInteger(categoryId) || categoryId <= 0) {
+    res.status(400).json({ detail: 'Invalid category_id' });
+    return;
+  }
+  const categoryExists = db.prepare('SELECT id FROM categories WHERE id = ?').get(categoryId);
+  if (!categoryExists) {
+    res.status(404).json({
+      detail: 'Selected category was not found. Please refresh and choose a valid category.',
+    });
+    return;
+  }
 
-  db.prepare(`
-    UPDATE workflows
-    SET name = ?, description = ?, category_id = ?, output_type = ?, output_node_ids_json = ?, comfy_api_json = ?, ui_inputs_json = ?, updated_at = datetime('now')
-    WHERE id = ?
-  `).run(name, description, categoryId, outputType, outputNodeIdsJson, comfyApiJson, uiInputsJson, id);
+  const rawOutputType = String(req.body?.output_type ?? existing.output_type ?? 'auto').trim().toLowerCase();
+  const outputType = ['auto', 'image', 'video'].includes(rawOutputType) ? rawOutputType : 'auto';
 
-  const updated = db
-    .prepare(`
-      SELECT w.*, c.name AS category_name
-      FROM workflows w
-      JOIN categories c ON c.id = w.category_id
-      WHERE w.id = ?
-    `)
-    .get(id);
-  res.json(mapWorkflowRow(updated!));
+  try {
+    const normalized =
+      req.body?.comfy_api_json && typeof req.body.comfy_api_json === 'object' && !Array.isArray(req.body.comfy_api_json)
+        ? normalizeComfyWorkflowPayload(req.body.comfy_api_json)
+        : null;
+    const comfyApiJson = normalized
+      ? JSON.stringify(normalized.workflow)
+      : String(existing.comfy_api_json);
+    const outputNodeIdsJson = Array.isArray(req.body?.output_node_ids)
+      ? JSON.stringify(req.body.output_node_ids.map((nid: unknown) => String(nid)))
+      : normalized && normalized.suggested_output_node_ids.length > 0 && String(existing.output_node_ids_json || '[]') === '[]'
+        ? JSON.stringify(normalized.suggested_output_node_ids)
+        : String(existing.output_node_ids_json || '[]');
+    const uiInputsJson = Array.isArray(req.body?.ui_inputs)
+      ? JSON.stringify(req.body.ui_inputs)
+      : String(existing.ui_inputs_json);
+
+    db.prepare(`
+      UPDATE workflows
+      SET name = ?, description = ?, category_id = ?, output_type = ?, output_node_ids_json = ?, comfy_api_json = ?, ui_inputs_json = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(name, description, categoryId, outputType, outputNodeIdsJson, comfyApiJson, uiInputsJson, id);
+
+    const updated = db
+      .prepare(`
+        SELECT w.*, COALESCE(c.name, 'Uncategorized') AS category_name
+        FROM workflows w
+        LEFT JOIN categories c ON c.id = w.category_id
+        WHERE w.id = ?
+      `)
+      .get(id);
+    if (!updated) {
+      res.status(404).json({ detail: 'Workflow template not found' });
+      return;
+    }
+    res.json(mapWorkflowRow(updated));
+  } catch (err) {
+    res.status(400).json({
+      detail: err instanceof Error ? err.message : 'Failed to update workflow template',
+    });
+  }
 });
 
 app.delete('/api/workflows/:id', (req: Request, res: Response) => {
