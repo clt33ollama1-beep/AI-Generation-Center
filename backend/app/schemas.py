@@ -12,7 +12,7 @@ WidgetType = Literal[
     "image_upload",
 ]
 
-OutputMediaType = Literal["auto", "image", "video"]
+OutputMediaType = Literal["auto", "image", "video", "text"]
 
 
 class UIInputField(BaseModel):
@@ -67,6 +67,7 @@ class InspectedInput(BaseModel):
     default_value: str | int | float | bool
     suggested_widget: WidgetType
     is_media_input: bool
+    options: Optional[list[str]] = None
 
 
 class InspectedNode(BaseModel):
@@ -96,7 +97,7 @@ class InspectedOutput(BaseModel):
     node_id: str
     class_type: str
     title: str
-    media_type: Literal["image", "video"]
+    media_type: Literal["image", "video", "text"]
     format: str
     is_primary_app_output: bool = False
 
@@ -151,13 +152,14 @@ class OutputFileInfo(BaseModel):
     filename: str
     original_filename: str
     url: str
-    media_type: Literal["image", "video"]
+    media_type: Literal["image", "video", "text"]
     format: str
     node_id: str
     width: Optional[int] = None
     height: Optional[int] = None
     duration_seconds: Optional[float] = None
     file_size: Optional[int] = None
+    text_content: Optional[str] = None
 
 
 class InputMediaInfo(BaseModel):
@@ -184,7 +186,7 @@ class GenerationRead(BaseModel):
     prompt_id: str
     client_id: str
     status: Literal["completed", "failed", "running"]
-    media_type: Literal["image", "video"]
+    media_type: Literal["image", "video", "text"]
     primary_output_url: str
     outputs: list[OutputFileInfo]
     input_media: list[InputMediaInfo] = Field(default_factory=list)

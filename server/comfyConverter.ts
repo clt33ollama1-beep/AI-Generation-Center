@@ -105,6 +105,25 @@ const IMAGE_OUTPUT_NODE_TYPES = new Set([
   'Image Comparer (rgthree)',
 ]);
 
+const TEXT_OUTPUT_NODE_TYPES = new Set([
+  'ShowText|pysssss',
+  'ShowText',
+  'Show Text',
+  'Display Text (rgthree)',
+  'DisplayText',
+  'PreviewText',
+  'PreviewTextNode',
+  'SaveText',
+  'SaveText|pysssss',
+  'SaveTextFile',
+  'PreviewAny',
+  'easy showAnything',
+  'DisplayAny',
+  'StringOutput',
+  'OutputString',
+  'Text Output',
+]);
+
 const PRIMARY_SINK_NODE_TYPES = new Set([
   'SaveImage',
   'SaveImageAdvanced',
@@ -113,6 +132,19 @@ const PRIMARY_SINK_NODE_TYPES = new Set([
   'SaveWEBM',
   'SaveAnimatedWEBP',
   'SaveAnimatedPNG',
+  'ShowText|pysssss',
+  'ShowText',
+  'Show Text',
+  'Display Text (rgthree)',
+  'DisplayText',
+  'PreviewText',
+  'PreviewTextNode',
+  'SaveText',
+  'SaveText|pysssss',
+  'SaveTextFile',
+  'StringOutput',
+  'OutputString',
+  'Text Output',
 ]);
 
 export function isComfyGraphWorkflow(payload: unknown): payload is ComfyGraphWorkflow {
@@ -147,7 +179,7 @@ function classifyOutputNode(
   const rawFormat = typeof inputs.format === 'string' ? inputs.format : '';
   const fmtLower = rawFormat.toLowerCase();
 
-  let mediaType: 'image' | 'video' = 'image';
+  let mediaType: 'image' | 'video' | 'text' = 'image';
   let format = rawFormat || 'png';
 
   if (
@@ -165,6 +197,13 @@ function classifyOutputNode(
       else if (node.class_type === 'SaveAnimatedPNG') format = 'apng';
       else format = 'mp4';
     }
+  } else if (
+    TEXT_OUTPUT_NODE_TYPES.has(node.class_type) ||
+    fmtLower.startsWith('text/') ||
+    ['txt', 'md', 'markdown', 'json', 'csv', 'srt', 'vtt'].includes(fmtLower)
+  ) {
+    mediaType = 'text';
+    format = rawFormat || 'txt';
   }
 
   return {
@@ -209,7 +248,11 @@ export function extractWorkflowOutputs(
     if (seen.has(nodeId)) continue;
     const node = apiWorkflow[nodeId];
     if (!node || typeof node !== 'object' || !node.class_type) continue;
-    if (VIDEO_OUTPUT_NODE_TYPES.has(node.class_type) || IMAGE_OUTPUT_NODE_TYPES.has(node.class_type)) {
+    if (
+      VIDEO_OUTPUT_NODE_TYPES.has(node.class_type) ||
+      IMAGE_OUTPUT_NODE_TYPES.has(node.class_type) ||
+      TEXT_OUTPUT_NODE_TYPES.has(node.class_type)
+    ) {
       outputs.push(classifyOutputNode(nodeId, node, primarySet.has(nodeId)));
       seen.add(nodeId);
     }
@@ -226,6 +269,8 @@ export function extractWorkflowOutputs(
     suggestedOutputType = 'video';
   } else if (effectiveOutputs.some((o) => o.media_type === 'image')) {
     suggestedOutputType = 'image';
+  } else if (effectiveOutputs.some((o) => o.media_type === 'text')) {
+    suggestedOutputType = 'text';
   }
 
   const suggestedOutputNodeIds =

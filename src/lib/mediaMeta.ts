@@ -10,7 +10,7 @@ export interface RawMediaMeta {
   height?: number | null;
   duration_seconds?: number | null;
   file_size?: number | null;
-  media_type?: 'image' | 'video';
+  media_type?: 'image' | 'video' | 'text';
   format?: string | null;
 }
 
@@ -72,6 +72,15 @@ export function formatFileSize(bytes?: number | null): string | null {
   if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
   const gb = mb / 1024;
   return `${gb.toFixed(2)} GB`;
+}
+
+export function formatTextStats(text?: string | null): string | null {
+  if (typeof text !== 'string' || text.length === 0) {
+    return null;
+  }
+  const chars = text.length;
+  const lines = text.split(/\r\n|\r|\n/).length;
+  return lines > 1 ? `${chars.toLocaleString()} chars · ${lines.toLocaleString()} lines` : `${chars.toLocaleString()} chars`;
 }
 
 export function resolveMediaMeta(

@@ -267,11 +267,45 @@ def to_ws_url(comfyui_url: str, client_id: str) -> str:
 def detect_media_type(filename: str, fmt: str = "") -> str:
     lower = filename.lower()
     fmt_lower = fmt.lower()
+    if fmt_lower.startswith("text/") or lower.endswith(
+        (".txt", ".md", ".markdown", ".json", ".csv", ".srt", ".vtt", ".log", ".yaml", ".yml", ".xml")
+    ):
+        return "text"
     if fmt_lower.startswith("video/") or lower.endswith(
         (".mp4", ".webm", ".mov", ".mkv", ".gif")
     ):
         return "video"
     return "image"
+
+
+def _extract_inline_texts(node_output: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+
+    def collect_from_mapping(mapping: dict[str, Any]) -> None:
+        for key in ("text", "texts", "string", "strings", "markdown"):
+            val = mapping.get(key)
+            if isinstance(val, str):
+                if val.strip():
+                    texts.append(val)
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str) and item.strip():
+                        texts.append(item)
+
+    collect_from_mapping(node_output)
+    if not texts and isinstance(node_output.get("ui"), dict):
+        collect_from_mapping(node_output["ui"])
+    return texts
+
+
+def _has_node_outputs(out: Any) -> bool:
+    if not isinstance(out, dict):
+        return False
+    for key in ("videos", "gifs", "images", "texts", "files"):
+        items = out.get(key)
+        if isinstance(items, list) and len(items) > 0:
+            return True
+    return len(_extract_inline_texts(out)) > 0
 
 
 def safe_dir_segment(value: str, fallback: str = "uncategorized") -> str:
@@ -313,6 +347,16 @@ def guess_mime_type(filename: str) -> str:
         return "video/quicktime"
     if lower.endswith(".mkv"):
         return "video/x-matroska"
+    if lower.endswith((".txt", ".log", ".srt")):
+        return "text/plain; charset=utf-8"
+    if lower.endswith((".md", ".markdown")):
+        return "text/markdown; charset=utf-8"
+    if lower.endswith(".json"):
+        return "application/json; charset=utf-8"
+    if lower.endswith(".csv"):
+        return "text/csv; charset=utf-8"
+    if lower.endswith(".vtt"):
+        return "text/vtt; charset=utf-8"
     return "application/octet-stream"
 
 
@@ -380,9 +424,7 @@ async def download_comfy_outputs(
             [
                 (nid, out)
                 for nid, out in all_items
-                if str(nid) in preferred_set
-                and isinstance(out, dict)
-                and any(isinstance(out.get(k), list) and out.get(k) for k in ("videos", "gifs", "images"))
+                if str(nid) in preferred_set and _has_node_outputs(out)
             ]
             if preferred_set
             else []
@@ -400,13 +442,15 @@ async def download_comfy_outputs(
             if not isinstance(node_output, dict):
                 continue
             candidates: list[dict[str, Any]] = []
-            for key in ("videos", "gifs", "images"):
+            for key in ("videos", "gifs", "images", "texts", "files"):
                 items = node_output.get(key)
                 if isinstance(items, list):
-                    candidates.extend(items)
+                    for item in items:
+                        if isinstance(item, dict) and item.get("filename"):
+                            candidates.append(item)
 
             for item in candidates:
-                orig_name = item.get("filename")
+                orig_name = str(item.get("filename") or "")
                 if not orig_name:
                     continue
                 qs = urlencode(
@@ -426,23 +470,58 @@ async def download_comfy_outputs(
                 local_path.write_bytes(view_resp.content)
 
                 rel_filename = f"{cat_dir}/{prompt_dir_seg}/{local_name}"
-                fmt = str(item.get("format") or ext.lstrip("."))
+                fmt = str(item.get("format") or ext.lstrip(".") or "png")
                 media_type = detect_media_type(orig_name, fmt)
-                media_meta = extract_media_metadata_from_file(
-                    local_path, media_type, cache_key=rel_filename
-                )
+                if media_type == "text":
+                    text_val = view_resp.content.decode("utf-8", errors="replace")[:500000]
+                    saved_outputs.append(
+                        OutputFileInfo(
+                            filename=rel_filename,
+                            original_filename=orig_name,
+                            url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/{quote(local_name, safe='')}",
+                            media_type="text",
+                            format=fmt,
+                            node_id=str(node_id),
+                            file_size=len(view_resp.content),
+                            text_content=text_val,
+                        )
+                    )
+                else:
+                    media_meta = extract_media_metadata_from_file(
+                        local_path, media_type, cache_key=rel_filename
+                    )
+                    saved_outputs.append(
+                        OutputFileInfo(
+                            filename=rel_filename,
+                            original_filename=orig_name,
+                            url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/{quote(local_name, safe='')}",
+                            media_type="video" if media_type == "video" else "image",
+                            format=fmt,
+                            node_id=str(node_id),
+                            width=media_meta.get("width"),
+                            height=media_meta.get("height"),
+                            duration_seconds=media_meta.get("duration_seconds"),
+                            file_size=media_meta.get("file_size"),
+                        )
+                    )
+
+            inline_texts = _extract_inline_texts(node_output)
+            for idx, text_val in enumerate(inline_texts):
+                local_name = f"{int(time.time() * 1000)}_{secrets.token_hex(4)}.txt"
+                local_path = target_dir / local_name
+                encoded = text_val.encode("utf-8")
+                local_path.write_bytes(encoded)
+                rel_filename = f"{cat_dir}/{prompt_dir_seg}/{local_name}"
                 saved_outputs.append(
                     OutputFileInfo(
                         filename=rel_filename,
-                        original_filename=orig_name,
+                        original_filename=f"node_{safe_dir_segment(str(node_id), 'text')}_output_{idx + 1}.txt",
                         url=f"/outputs/{quote(cat_dir, safe='')}/{quote(prompt_dir_seg, safe='')}/{quote(local_name, safe='')}",
-                        media_type="video" if media_type == "video" else "image",
-                        format=fmt,
+                        media_type="text",
+                        format="txt",
                         node_id=str(node_id),
-                        width=media_meta.get("width"),
-                        height=media_meta.get("height"),
-                        duration_seconds=media_meta.get("duration_seconds"),
-                        file_size=media_meta.get("file_size"),
+                        file_size=len(encoded),
+                        text_content=text_val[:500000],
                     )
                 )
 
@@ -688,7 +767,22 @@ async def _watch_ws_until_done(
         )
         duration_ms = int((time.monotonic() - started_at) * 1000)
         has_video = any(o.media_type == "video" for o in outputs)
-        primary_media_type = "video" if (output_type == "video" or has_video) else "image"
+        has_image = any(o.media_type == "image" for o in outputs)
+        has_text = any(o.media_type == "text" for o in outputs)
+        if output_type == "video":
+            primary_media_type = "video"
+        elif output_type == "text":
+            primary_media_type = "text"
+        elif output_type == "image":
+            primary_media_type = "image"
+        elif has_video:
+            primary_media_type = "video"
+        elif outputs and outputs[0].media_type == "text":
+            primary_media_type = "text"
+        elif not has_image and has_text:
+            primary_media_type = "text"
+        else:
+            primary_media_type = "image"
         primary_url = outputs[0].url if outputs else ""
         input_media_list = [m.model_dump() for m in (input_media or [])]
 

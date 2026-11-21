@@ -6,7 +6,9 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  Copy,
   Download,
+  FileText,
   Film,
   Image as ImageIcon,
   ListPlus,
@@ -23,6 +25,7 @@ import {
 import {
   formatDimensions,
   formatFileSize,
+  formatTextStats,
   formatVideoDuration,
   resolveMediaMeta,
   type MeasuredMediaMeta,
@@ -136,7 +139,18 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [selectedOutputIndex, setSelectedOutputIndex] = useState(0);
   const [queuedFeedback, setQueuedFeedback] = useState<string | null>(null);
   const [measuredByUrl, setMeasuredByUrl] = useState<Record<string, MeasuredMediaMeta>>({});
+  const [copiedOutput, setCopiedOutput] = useState(false);
   const feedbackTimerRef = useRef<number | null>(null);
+
+  const handleCopyOutputText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedOutput(true);
+      window.setTimeout(() => setCopiedOutput(false), 1800);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const recordMeasuredMedia = (url: string, meta: MeasuredMediaMeta) => {
     if (!url) return;
@@ -372,6 +386,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   useEffect(() => {
     setSelectedOutputIndex(0);
+    setCopiedOutput(false);
   }, [selectedOutputTask?.id]);
 
   const lastTask = safeQueueTasks[safeQueueTasks.length - 1] || null;
@@ -469,6 +484,8 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                             <span className="truncate font-medium">{wf.name}</span>
                             {wf.output_type === 'video' ? (
                               <Film className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                            ) : wf.output_type === 'text' ? (
+                              <FileText className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                             ) : (
                               <ImageIcon className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                             )}
@@ -519,7 +536,13 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                 <span aria-hidden="true">·</span>
                 <span className="tabular-nums">{sortedFields.length} parameters</span>
                 <span aria-hidden="true">·</span>
-                <span>{activeWorkflow.output_type === 'video' ? 'Video output' : 'Image output'}</span>
+                <span>
+                  {activeWorkflow.output_type === 'video'
+                    ? 'Video output'
+                    : activeWorkflow.output_type === 'text'
+                      ? 'Text output'
+                      : 'Image output'}
+                </span>
               </div>
               <h1 className="font-display text-xl font-semibold text-zinc-100">
                 {activeWorkflow.name}
@@ -827,8 +850,12 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                                     firstOut?.media_type === 'video'
                                       ? formatVideoDuration(firstOut?.duration_seconds)
                                       : null;
+                                  const txtStats =
+                                    firstOut?.media_type === 'text'
+                                      ? formatTextStats(firstOut?.text_content)
+                                      : null;
                                   const genSec = `${((task.generation?.duration_ms || 0) / 1000).toFixed(1)}s`;
-                                  return [dims, vidDur, genSec].filter(Boolean).join(' · ');
+                                  return [dims, vidDur, txtStats, genSec].filter(Boolean).join(' · ');
                                 })()}
                                 {task.status === 'failed' && (
                                   <span className="text-red-400">Failed</span>
@@ -956,6 +983,37 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                     }}
                     className="max-w-full max-h-full object-contain"
                   />
+                ) : currentOutput.media_type === 'text' ? (
+                  <div className="w-full h-full flex flex-col min-h-0">
+                    <div className="px-3.5 py-2 border-b border-zinc-800/80 bg-[#12151B] flex items-center justify-between gap-2 shrink-0">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-mono text-zinc-300 truncate">
+                        <FileText className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                        <span className="truncate">
+                          {currentOutput.original_filename || currentOutput.filename}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyOutputText(currentOutput.text_content || '')}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded transition-colors shrink-0 cursor-pointer"
+                      >
+                        {copiedOutput ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            Copy Text
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <pre className="flex-1 min-h-0 overflow-auto p-4 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed select-text">
+                      {currentOutput.text_content ?? '(Empty text output)'}
+                    </pre>
+                  </div>
                 ) : (
                   <img
                     src={currentOutput.url}
@@ -979,12 +1037,17 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                     const tabSpec =
                       out.media_type === 'video'
                         ? tabMeta.durationText || tabMeta.dimensionsText
-                        : tabMeta.dimensionsText;
+                        : out.media_type === 'text'
+                          ? formatTextStats(out.text_content) || 'TXT'
+                          : tabMeta.dimensionsText;
                     return (
                       <button
                         key={out.filename}
                         type="button"
-                        onClick={() => setSelectedOutputIndex(idx)}
+                        onClick={() => {
+                          setSelectedOutputIndex(idx);
+                          setCopiedOutput(false);
+                        }}
                         className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded border transition-colors shrink-0 cursor-pointer ${
                           idx === selectedOutputIndex
                             ? 'border-blue-500 bg-blue-600/15 text-blue-300'
@@ -1005,6 +1068,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                     currentOutput.format.toUpperCase(),
                     currentOutputMeta?.dimensionsText,
                     currentOutput.media_type === 'video' ? currentOutputMeta?.durationText : null,
+                    currentOutput.media_type === 'text'
+                      ? formatTextStats(currentOutput.text_content)
+                      : null,
                     currentOutputMeta?.fileSizeText || formatFileSize(currentOutput.file_size),
                     `Gen ${((latestGeneration?.duration_ms || 0) / 1000).toFixed(1)}s`,
                   ]
@@ -1026,7 +1092,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
               <Sparkles className="w-6 h-6 text-zinc-600" />
               <p className="text-xs font-medium text-zinc-300">Live Output Viewport</p>
               <p className="text-xs text-zinc-500 max-w-xs leading-relaxed">
-                Generated PNG/WEBP stills and VHS_VideoCombine MP4/WEBM/GIF animations will stream and render here upon completion.
+                Generated PNG/WEBP images, VHS_VideoCombine MP4/WEBM clips, and text outputs will render here upon completion.
               </p>
             </div>
           )}

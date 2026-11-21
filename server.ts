@@ -174,6 +174,15 @@ function guessMimeType(filename: string): string {
   if (lower.endsWith('.webm')) return 'video/webm';
   if (lower.endsWith('.mov')) return 'video/quicktime';
   if (lower.endsWith('.mkv')) return 'video/x-matroska';
+  if (lower.endsWith('.txt') || lower.endsWith('.log') || lower.endsWith('.srt')) {
+    return 'text/plain; charset=utf-8';
+  }
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+    return 'text/markdown; charset=utf-8';
+  }
+  if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+  if (lower.endsWith('.csv')) return 'text/csv; charset=utf-8';
+  if (lower.endsWith('.vtt')) return 'text/vtt; charset=utf-8';
   return 'application/octet-stream';
 }
 
@@ -253,7 +262,199 @@ const MEDIA_NODE_TYPES = new Set([
   'LoadVideo',
 ]);
 
-function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
+const FALLBACK_COMBO_OPTIONS: Record<string, string[]> = {
+  sampler_name: [
+    'euler',
+    'euler_ancestral',
+    'heun',
+    'heunpp2',
+    'dpm_2',
+    'dpm_2_ancestral',
+    'lms',
+    'dpm_fast',
+    'dpm_adaptive',
+    'dpmpp_2s_ancestral',
+    'dpmpp_sde',
+    'dpmpp_sde_gpu',
+    'dpmpp_2m',
+    'dpmpp_2m_sde',
+    'dpmpp_2m_sde_gpu',
+    'dpmpp_3m_sde',
+    'dpmpp_3m_sde_gpu',
+    'ddpm',
+    'lcm',
+    'ipndm',
+    'ipndm_v',
+    'deis',
+    'res_multistep',
+    'ddim',
+    'uni_pc',
+    'uni_pc_bh2',
+  ],
+  scheduler: [
+    'normal',
+    'karras',
+    'exponential',
+    'sgm_uniform',
+    'simple',
+    'ddim_uniform',
+    'beta',
+    'linear_quadratic',
+    'kl_optimal',
+  ],
+  upscale_method: ['nearest-exact', 'bilinear', 'area', 'bicubic', 'lanczos'],
+  crop: ['disabled', 'center'],
+  pix_fmt: ['yuv420p', 'yuv420p10le', 'yuva420p'],
+  weight_dtype: ['default', 'fp8_e4m3fn', 'fp8_e4m3fn_fast', 'fp8_e5m2'],
+  device: ['default', 'cpu', 'cuda'],
+};
+
+const FALLBACK_SELECTOR_FIELDS = new Set([
+  'ckpt_name',
+  'vae_name',
+  'lora_name',
+  'lora_01',
+  'lora_02',
+  'lora_03',
+  'model_name',
+  'control_net_name',
+  'clip_name',
+  'clip_name1',
+  'clip_name2',
+  'clip_name3',
+  'unet_name',
+  'upscale_model',
+  'style_model_name',
+  'ipadapter_file',
+  'clip_vision',
+]);
+
+interface ComfyObjectInfoDef {
+  input?: {
+    required?: Record<string, unknown>;
+    optional?: Record<string, unknown>;
+  };
+}
+
+async function fetchComfyObjectInfo(
+  comfyUrl: string,
+  classTypes: string[],
+): Promise<Record<string, ComfyObjectInfoDef>> {
+  const baseUrl = (comfyUrl || '').trim().replace(/\/+$/, '');
+  const uniqueTypes = Array.from(new Set(classTypes.filter(Boolean)));
+  if (!baseUrl || uniqueTypes.length === 0) return {};
+
+  const result: Record<string, ComfyObjectInfoDef> = {};
+  await Promise.allSettled(
+    uniqueTypes.map(async (ct) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2200);
+      try {
+        const res = await fetch(`${baseUrl}/object_info/${encodeURIComponent(ct)}`, {
+          signal: controller.signal,
+        });
+        if (!res.ok) return;
+        const payload = (await res.json()) as Record<string, unknown>;
+        if (!payload || typeof payload !== 'object') return;
+        const maybeDef = payload[ct];
+        if (maybeDef && typeof maybeDef === 'object') {
+          result[ct] = maybeDef as ComfyObjectInfoDef;
+        } else if (payload.input && typeof payload.input === 'object') {
+          result[ct] = payload as ComfyObjectInfoDef;
+        }
+      } catch {
+        // Ignore offline/unreachable ComfyUI during workflow import
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  return result;
+}
+
+function dedupeComboOptions(rawItems: unknown[], defaultVal: unknown): string[] {
+  const seen = new Set<string>();
+  const opts: string[] = [];
+  for (const item of rawItems) {
+    if (item === null || item === undefined || typeof item === 'object') continue;
+    const str = String(item);
+    if (!seen.has(str)) {
+      seen.add(str);
+      opts.push(str);
+    }
+  }
+  if (defaultVal !== null && defaultVal !== undefined && typeof defaultVal !== 'boolean') {
+    const defStr = String(defaultVal);
+    if (defStr && !seen.has(defStr)) {
+      opts.unshift(defStr);
+    }
+  }
+  return opts;
+}
+
+function resolveComboOptions(
+  classType: string,
+  fieldName: string,
+  defaultVal: unknown,
+  objectInfo: Record<string, ComfyObjectInfoDef>,
+): string[] | undefined {
+  const nodeDef = objectInfo[classType];
+  if (nodeDef?.input) {
+    for (const groupName of ['required', 'optional'] as const) {
+      const group = nodeDef.input[groupName];
+      if (!group || typeof group !== 'object' || !(fieldName in group)) continue;
+      const spec = group[fieldName];
+      if (Array.isArray(spec) && spec.length >= 1) {
+        if (Array.isArray(spec[0])) {
+          return dedupeComboOptions(spec[0], defaultVal);
+        }
+        if (
+          spec[0] === 'COMBO' &&
+          spec.length >= 2 &&
+          spec[1] &&
+          typeof spec[1] === 'object' &&
+          Array.isArray((spec[1] as { options?: unknown[] }).options)
+        ) {
+          return dedupeComboOptions((spec[1] as { options: unknown[] }).options, defaultVal);
+        }
+      }
+      return undefined;
+    }
+  }
+
+  const lowerField = fieldName.toLowerCase();
+  if (lowerField in FALLBACK_COMBO_OPTIONS) {
+    return dedupeComboOptions(FALLBACK_COMBO_OPTIONS[lowerField], defaultVal);
+  }
+
+  if (
+    lowerField === 'format' &&
+    (classType === 'VHS_VideoCombine' ||
+      (typeof defaultVal === 'string' &&
+        (defaultVal.includes('/') ||
+          ['gif', 'webp', 'mp4', 'webm'].includes(defaultVal.toLowerCase()))))
+  ) {
+    return dedupeComboOptions(
+      ['video/h264-mp4', 'video/h265-mp4', 'video/webm', 'video/prores', 'image/gif', 'image/webp'],
+      defaultVal,
+    );
+  }
+
+  if (
+    FALLBACK_SELECTOR_FIELDS.has(lowerField) &&
+    typeof defaultVal === 'string' &&
+    defaultVal.trim() !== ''
+  ) {
+    return [defaultVal];
+  }
+
+  return undefined;
+}
+
+function inspectComfyWorkflow(
+  workflow: ComfyApiWorkflow,
+  objectInfo: Record<string, ComfyObjectInfoDef> = {},
+): InspectedNode[] {
   const inspectedNodes: InspectedNode[] = [];
 
   for (const [nodeId, node] of Object.entries(workflow)) {
@@ -282,6 +483,7 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
       let suggestedWidget: WidgetType = 'text';
       const defaultValue: string | number | boolean =
         rawVal === null || rawVal === undefined ? '' : (rawVal as string | number | boolean);
+      let comboOptions: string[] | undefined;
 
       if (isMediaField) {
         valueType = 'media';
@@ -289,25 +491,34 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
       } else if (typeof rawVal === 'boolean') {
         valueType = 'boolean';
         suggestedWidget = 'checkbox';
-      } else if (typeof rawVal === 'number') {
-        valueType = Number.isInteger(rawVal) ? 'int' : 'float';
-        if (lowerField.includes('seed')) {
-          suggestedWidget = 'seed_randomizer';
-        } else {
-          suggestedWidget = 'number';
-        }
       } else {
-        valueType = 'string';
-        const strVal = String(defaultValue);
-        if (
-          lowerField === 'text' ||
-          lowerField.includes('prompt') ||
-          node.class_type.toLowerCase().includes('multiline') ||
-          strVal.length > 48
-        ) {
-          suggestedWidget = 'textarea';
+        comboOptions = resolveComboOptions(node.class_type, fieldName, defaultValue, objectInfo);
+        if (typeof rawVal === 'number') {
+          valueType = Number.isInteger(rawVal) ? 'int' : 'float';
+          if (comboOptions !== undefined) {
+            suggestedWidget = 'select';
+          } else if (lowerField.includes('seed')) {
+            suggestedWidget = 'seed_randomizer';
+          } else {
+            suggestedWidget = 'number';
+          }
         } else {
-          suggestedWidget = 'text';
+          valueType = 'string';
+          if (comboOptions !== undefined) {
+            suggestedWidget = 'select';
+          } else {
+            const strVal = String(defaultValue);
+            if (
+              lowerField === 'text' ||
+              lowerField.includes('prompt') ||
+              node.class_type.toLowerCase().includes('multiline') ||
+              strVal.length > 48
+            ) {
+              suggestedWidget = 'textarea';
+            } else {
+              suggestedWidget = 'text';
+            }
+          }
         }
       }
 
@@ -317,6 +528,7 @@ function inspectComfyWorkflow(workflow: ComfyApiWorkflow): InspectedNode[] {
         default_value: defaultValue,
         suggested_widget: suggestedWidget,
         is_media_input: isMediaField,
+        ...(comboOptions !== undefined ? { options: comboOptions } : {}),
       });
     }
 
@@ -369,10 +581,50 @@ function mapWorkflowRow(row: Record<string, unknown>) {
   };
 }
 
-function enrichMediaEntry<T extends { filename?: string; media_type?: 'image' | 'video'; width?: number | null; height?: number | null; duration_seconds?: number | null; file_size?: number | null }>(
-  item: T,
-): T {
+function enrichMediaEntry<
+  T extends {
+    filename?: string;
+    media_type?: 'image' | 'video' | 'text';
+    width?: number | null;
+    height?: number | null;
+    duration_seconds?: number | null;
+    file_size?: number | null;
+    text_content?: string | null;
+  },
+>(item: T): T {
   if (!item || !item.filename) return item;
+  if (item.media_type === 'text') {
+    const needsText = item.text_content == null;
+    const needsSize = item.file_size == null;
+    if (!needsText && !needsSize) return item;
+    const safePath = resolveSafeOutputsPath(item.filename);
+    if (!safePath || !fs.existsSync(safePath)) return item;
+    let fileSize = item.file_size ?? null;
+    let textContent = item.text_content ?? null;
+    try {
+      if (fileSize == null) {
+        fileSize = fs.statSync(safePath).size;
+      }
+      if (textContent == null) {
+        const fd = fs.openSync(safePath, 'r');
+        try {
+          const maxBytes = 262144;
+          const buf = Buffer.allocUnsafe(maxBytes);
+          const bytesRead = fs.readSync(fd, buf, 0, maxBytes, 0);
+          textContent = buf.subarray(0, bytesRead).toString('utf8');
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+    } catch {
+      // ignore disk read errors
+    }
+    return {
+      ...item,
+      file_size: fileSize,
+      text_content: textContent,
+    };
+  }
   const needsDims = item.width == null || item.height == null;
   const needsDuration = item.media_type === 'video' && item.duration_seconds == null;
   const needsSize = item.file_size == null;
@@ -525,9 +777,28 @@ function toComfyWebSocketUrl(httpUrl: string, clientId: string): string {
   return `${wsProtocol}//${parsed.host}/ws?clientId=${encodeURIComponent(clientId)}`;
 }
 
-function detectMediaTypeFromFilename(filename: string, format?: string): 'image' | 'video' {
+function detectMediaTypeFromFilename(
+  filename: string,
+  format?: string,
+): 'image' | 'video' | 'text' {
   const lower = filename.toLowerCase();
   const fmt = (format || '').toLowerCase();
+  if (
+    fmt.startsWith('text/') ||
+    lower.endsWith('.txt') ||
+    lower.endsWith('.md') ||
+    lower.endsWith('.markdown') ||
+    lower.endsWith('.json') ||
+    lower.endsWith('.csv') ||
+    lower.endsWith('.srt') ||
+    lower.endsWith('.vtt') ||
+    lower.endsWith('.log') ||
+    lower.endsWith('.yaml') ||
+    lower.endsWith('.yml') ||
+    lower.endsWith('.xml')
+  ) {
+    return 'text';
+  }
   if (
     fmt.startsWith('video/') ||
     lower.endsWith('.mp4') ||
@@ -539,6 +810,39 @@ function detectMediaTypeFromFilename(filename: string, format?: string): 'image'
     return 'video';
   }
   return 'image';
+}
+
+function extractInlineTexts(nodeOutput: Record<string, unknown>): string[] {
+  const texts: string[] = [];
+  const collectFrom = (mapping: Record<string, unknown>) => {
+    for (const key of ['text', 'texts', 'string', 'strings', 'markdown']) {
+      const val = mapping[key];
+      if (typeof val === 'string') {
+        if (val.trim()) texts.push(val);
+      } else if (Array.isArray(val)) {
+        for (const item of val) {
+          if (typeof item === 'string' && item.trim()) {
+            texts.push(item);
+          }
+        }
+      }
+    }
+  };
+  collectFrom(nodeOutput);
+  if (texts.length === 0 && nodeOutput.ui && typeof nodeOutput.ui === 'object' && !Array.isArray(nodeOutput.ui)) {
+    collectFrom(nodeOutput.ui as Record<string, unknown>);
+  }
+  return texts;
+}
+
+function hasNodeOutputs(out: unknown): boolean {
+  if (!out || typeof out !== 'object' || Array.isArray(out)) return false;
+  const obj = out as Record<string, unknown>;
+  for (const key of ['videos', 'gifs', 'images', 'texts', 'files']) {
+    const val = obj[key];
+    if (Array.isArray(val) && val.length > 0) return true;
+  }
+  return extractInlineTexts(obj).length > 0;
 }
 
 async function uploadMediaToComfyUI(
@@ -568,6 +872,13 @@ async function uploadMediaToComfyUI(
   return data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
 }
 
+interface ComfyHistoryFileItem {
+  filename: string;
+  subfolder?: string;
+  type?: string;
+  format?: string;
+}
+
 async function downloadComfyOutputs(
   comfyUrl: string,
   promptId: string,
@@ -582,14 +893,7 @@ async function downloadComfyOutputs(
   const historyPayload = (await historyRes.json()) as Record<
     string,
     {
-      outputs?: Record<
-        string,
-        {
-          images?: Array<{ filename: string; subfolder?: string; type?: string; format?: string }>;
-          gifs?: Array<{ filename: string; subfolder?: string; type?: string; format?: string }>;
-          videos?: Array<{ filename: string; subfolder?: string; type?: string; format?: string }>;
-        }
-      >;
+      outputs?: Record<string, Record<string, unknown>>;
     }
   >;
 
@@ -602,12 +906,7 @@ async function downloadComfyOutputs(
   const allEntries = Object.entries(entry.outputs);
   const matchingPreferred =
     preferredSet.size > 0
-      ? allEntries.filter(([nodeId, out]) => {
-          if (!preferredSet.has(String(nodeId))) return false;
-          return (
-            (out.videos?.length || 0) + (out.gifs?.length || 0) + (out.images?.length || 0) > 0
-          );
-        })
+      ? allEntries.filter(([nodeId, out]) => preferredSet.has(String(nodeId)) && hasNodeOutputs(out))
       : [];
   const entriesToDownload = matchingPreferred.length > 0 ? matchingPreferred : allEntries;
 
@@ -619,11 +918,18 @@ async function downloadComfyOutputs(
   const savedOutputs: OutputFileInfo[] = [];
 
   for (const [nodeId, nodeOutput] of entriesToDownload) {
-    const candidates = [
-      ...(nodeOutput.videos || []),
-      ...(nodeOutput.gifs || []),
-      ...(nodeOutput.images || []),
-    ];
+    if (!nodeOutput || typeof nodeOutput !== 'object') continue;
+    const candidates: ComfyHistoryFileItem[] = [];
+    for (const key of ['videos', 'gifs', 'images', 'texts', 'files']) {
+      const items = nodeOutput[key];
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          if (item && typeof item === 'object' && typeof (item as ComfyHistoryFileItem).filename === 'string') {
+            candidates.push(item as ComfyHistoryFileItem);
+          }
+        }
+      }
+    }
 
     for (const item of candidates) {
       if (!item.filename) continue;
@@ -639,27 +945,68 @@ async function downloadComfyOutputs(
       }
 
       const arrayBuf = await viewRes.arrayBuffer();
+      const buf = Buffer.from(arrayBuf);
       const ext = path.extname(item.filename) || '.png';
       const localName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
       const localPath = path.join(targetDir, localName);
-      fs.writeFileSync(localPath, Buffer.from(arrayBuf));
+      fs.writeFileSync(localPath, buf);
 
       const relFilename = `${catDir}/${promptDirSeg}/${localName}`;
-      const mediaType = detectMediaTypeFromFilename(item.filename, item.format);
-      const mediaMeta = extractMediaMetadataFromFile(localPath, mediaType, relFilename);
+      const format = item.format || ext.replace('.', '') || 'png';
+      const mediaType = detectMediaTypeFromFilename(item.filename, format);
+      if (mediaType === 'text') {
+        const textContent = buf.toString('utf8').slice(0, 500000);
+        savedOutputs.push({
+          filename: relFilename,
+          original_filename: item.filename,
+          url: buildOutputUrl(catDir, promptDirSeg, localName),
+          media_type: 'text',
+          format,
+          node_id: nodeId,
+          width: null,
+          height: null,
+          duration_seconds: null,
+          file_size: buf.length,
+          text_content: textContent,
+        });
+      } else {
+        const mediaMeta = extractMediaMetadataFromFile(localPath, mediaType, relFilename);
+        savedOutputs.push({
+          filename: relFilename,
+          original_filename: item.filename,
+          url: buildOutputUrl(catDir, promptDirSeg, localName),
+          media_type: mediaType,
+          format,
+          node_id: nodeId,
+          width: mediaMeta.width,
+          height: mediaMeta.height,
+          duration_seconds: mediaMeta.duration_seconds,
+          file_size: mediaMeta.file_size,
+        });
+      }
+    }
+
+    const inlineTexts = extractInlineTexts(nodeOutput);
+    inlineTexts.forEach((textVal, idx) => {
+      const localName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.txt`;
+      const localPath = path.join(targetDir, localName);
+      const buf = Buffer.from(textVal, 'utf8');
+      fs.writeFileSync(localPath, buf);
+      const relFilename = `${catDir}/${promptDirSeg}/${localName}`;
       savedOutputs.push({
         filename: relFilename,
-        original_filename: item.filename,
+        original_filename: `node_${safeDirSegment(nodeId, 'text')}_output_${idx + 1}.txt`,
         url: buildOutputUrl(catDir, promptDirSeg, localName),
-        media_type: mediaType,
-        format: item.format || ext.replace('.', ''),
+        media_type: 'text',
+        format: 'txt',
         node_id: nodeId,
-        width: mediaMeta.width,
-        height: mediaMeta.height,
-        duration_seconds: mediaMeta.duration_seconds,
-        file_size: mediaMeta.file_size,
+        width: null,
+        height: null,
+        duration_seconds: null,
+        file_size: buf.length,
+        text_content: textVal.slice(0, 500000),
       });
-    }
+    });
   }
 
   return savedOutputs;
@@ -859,7 +1206,7 @@ app.delete('/api/categories/:id', (req: Request, res: Response) => {
 });
 
 // Workflow Inspector
-app.post('/api/workflows/inspect', (req: Request, res: Response) => {
+app.post('/api/workflows/inspect', async (req: Request, res: Response) => {
   const workflowJson = req.body?.comfy_api_json;
   if (!workflowJson || typeof workflowJson !== 'object' || Array.isArray(workflowJson)) {
     res.status(400).json({ detail: 'comfy_api_json must be a ComfyUI API or workflow JSON object' });
@@ -867,7 +1214,11 @@ app.post('/api/workflows/inspect', (req: Request, res: Response) => {
   }
   try {
     const normalized = normalizeComfyWorkflowPayload(workflowJson);
-    const nodes = inspectComfyWorkflow(normalized.workflow);
+    const classTypes = Object.values(normalized.workflow)
+      .map((node) => (node && typeof node === 'object' ? node.class_type : ''))
+      .filter((ct): ct is string => typeof ct === 'string' && ct.length > 0);
+    const objectInfo = await fetchComfyObjectInfo(getComfyUiUrl(), classTypes);
+    const nodes = inspectComfyWorkflow(normalized.workflow, objectInfo);
     res.json({
       nodes,
       outputs: normalized.outputs,
@@ -937,7 +1288,7 @@ app.post('/api/workflows', (req: Request, res: Response) => {
   try {
     const normalized = normalizeComfyWorkflowPayload(comfyApiJson);
     const rawOutputType = String(req.body?.output_type || normalized.suggested_output_type || 'auto').trim().toLowerCase();
-    const outputType = ['auto', 'image', 'video'].includes(rawOutputType) ? rawOutputType : 'auto';
+    const outputType = ['auto', 'image', 'video', 'text'].includes(rawOutputType) ? rawOutputType : 'auto';
     const outputNodeIds = Array.isArray(req.body?.output_node_ids)
       ? req.body.output_node_ids.map((id: unknown) => String(id))
       : normalized.suggested_output_node_ids;
@@ -1015,7 +1366,7 @@ app.put('/api/workflows/:id', (req: Request, res: Response) => {
   }
 
   const rawOutputType = String(req.body?.output_type ?? existing.output_type ?? 'auto').trim().toLowerCase();
-  const outputType = ['auto', 'image', 'video'].includes(rawOutputType) ? rawOutputType : 'auto';
+  const outputType = ['auto', 'image', 'video', 'text'].includes(rawOutputType) ? rawOutputType : 'auto';
 
   try {
     const normalized =
@@ -1081,7 +1432,7 @@ app.get('/api/generations', (req: Request, res: Response) => {
     .all()
     .map(mapGenerationRow);
 
-  if (mediaType === 'image' || mediaType === 'video') {
+  if (mediaType === 'image' || mediaType === 'video' || mediaType === 'text') {
     rows = rows.filter((g) => g.media_type === mediaType);
   }
   if (workflowId) {
@@ -1089,7 +1440,8 @@ app.get('/api/generations', (req: Request, res: Response) => {
   }
   if (search) {
     rows = rows.filter((g) => {
-      const hay = `${g.workflow_name} ${g.category_name} ${JSON.stringify(g.submitted_inputs)}`.toLowerCase();
+      const outputText = (g.outputs || []).map((o) => o.text_content || '').join(' ');
+      const hay = `${g.workflow_name} ${g.category_name} ${JSON.stringify(g.submitted_inputs)} ${outputText}`.toLowerCase();
       return hay.includes(search);
     });
   }
@@ -1438,7 +1790,7 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
           label: fieldLabelByKey.get(mediaKey),
           original_filename: origName,
           comfy_name: uploadedName,
-          media_type: detectMediaTypeFromFilename(origName, file.mimetype),
+          media_type: detectMediaTypeFromFilename(origName, file.mimetype) === 'video' ? 'video' : 'image',
           buffer: file.buffer,
         });
       }
@@ -1475,7 +1827,9 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
               media_type:
                 info.media_type === 'video' || info.media_type === 'image'
                   ? info.media_type
-                  : detectMediaTypeFromFilename(origName, mimeType),
+                  : detectMediaTypeFromFilename(origName, mimeType) === 'video'
+                    ? 'video'
+                    : 'image',
               buffer,
             });
           } else if (info.comfy_name) {
@@ -1659,8 +2013,20 @@ app.post('/api/generate', upload.any(), async (req: Request, res: Response) => {
       );
       const durationMs = Date.now() - startedAt;
       const hasVideo = outputs.some((o) => o.media_type === 'video');
-      const primaryMediaType: 'image' | 'video' =
-        workflowTemplate.output_type === 'video' || hasVideo ? 'video' : 'image';
+      const hasImage = outputs.some((o) => o.media_type === 'image');
+      const hasText = outputs.some((o) => o.media_type === 'text');
+      let primaryMediaType: 'image' | 'video' | 'text' = 'image';
+      if (workflowTemplate.output_type === 'video') {
+        primaryMediaType = 'video';
+      } else if (workflowTemplate.output_type === 'text') {
+        primaryMediaType = 'text';
+      } else if (workflowTemplate.output_type === 'image') {
+        primaryMediaType = 'image';
+      } else if (hasVideo) {
+        primaryMediaType = 'video';
+      } else if (outputs[0]?.media_type === 'text' || (!hasImage && hasText)) {
+        primaryMediaType = 'text';
+      }
       const primaryUrl = outputs[0]?.url || '';
 
       const insertResult = db

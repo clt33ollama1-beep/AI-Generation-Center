@@ -1,8 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Check,
   Clock,
+  Copy,
   Download,
   ExternalLink,
+  FileText,
   Film,
   Image as ImageIcon,
   Maximize2,
@@ -15,6 +18,7 @@ import {
 import { api } from '../lib/api.ts';
 import {
   formatFileSize,
+  formatTextStats,
   formatVideoDuration,
   resolveMediaMeta,
   type MeasuredMediaMeta,
@@ -36,7 +40,8 @@ interface LightboxMedia {
   url: string;
   title: string;
   filename: string;
-  mediaType: 'image' | 'video';
+  mediaType: 'image' | 'video' | 'text';
+  textContent?: string | null;
   width?: number | null;
   height?: number | null;
   durationSeconds?: number | null;
@@ -61,14 +66,18 @@ function formatDuration(durationMs: number): string {
 }
 
 export const GalleryView: React.FC<GalleryViewProps> = ({
-  categories,
-  generations,
-  workflows,
+  categories = [],
+  generations = [],
+  workflows = [],
   onDeleted,
   onReuseInWorkspace,
   onGoWorkspace,
 }) => {
-  const [mediaFilter, setMediaFilter] = useState<'all' | 'image' | 'video'>('all');
+  const safeCategories = Array.isArray(categories) ? categories : [];
+  const safeGenerations = Array.isArray(generations) ? generations : [];
+  const safeWorkflows = Array.isArray(workflows) ? workflows : [];
+
+  const [mediaFilter, setMediaFilter] = useState<'all' | 'image' | 'video' | 'text'>('all');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [workflowFilter, setWorkflowFilter] = useState<string>('all');
   const [sortBy, setSortBy] = useState<SortOption>('newest');
@@ -84,6 +93,19 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   } | null>(null);
   const [measuredByUrl, setMeasuredByUrl] = useState<Record<string, MeasuredMediaMeta>>({});
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const handleCopyText = async (text: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      window.setTimeout(() => {
+        setCopiedKey((curr) => (curr === key ? null : curr));
+      }, 1800);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const recordMeasuredMedia = (url: string, meta: MeasuredMediaMeta) => {
     if (!url) return;
@@ -107,30 +129,30 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const categoryOptions = useMemo(() => {
     const seen = new Set<string>();
     const names: string[] = [];
-    for (const c of categories) {
+    for (const c of safeCategories) {
       if (c.name && !seen.has(c.name)) {
         seen.add(c.name);
         names.push(c.name);
       }
     }
-    for (const g of generations) {
+    for (const g of safeGenerations) {
       if (g.category_name && !seen.has(g.category_name)) {
         seen.add(g.category_name);
         names.push(g.category_name);
       }
     }
     return names;
-  }, [categories, generations]);
+  }, [safeCategories, safeGenerations]);
 
   const availableWorkflows = useMemo(() => {
-    if (categoryFilter === 'all') return workflows;
-    return workflows.filter((wf) => wf.category_name === categoryFilter);
-  }, [workflows, categoryFilter]);
+    if (categoryFilter === 'all') return safeWorkflows;
+    return safeWorkflows.filter((wf) => wf.category_name === categoryFilter);
+  }, [safeWorkflows, categoryFilter]);
 
   const handleCategoryChange = (nextCategory: string) => {
     setCategoryFilter(nextCategory);
     if (nextCategory === 'all') return;
-    const stillValid = workflows.some(
+    const stillValid = safeWorkflows.some(
       (wf) => String(wf.id) === workflowFilter && wf.category_name === nextCategory,
     );
     if (!stillValid) {
@@ -140,12 +162,20 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const list = generations.filter((g) => {
-      if (mediaFilter !== 'all' && g.media_type !== mediaFilter) return false;
+    const list = safeGenerations.filter((g) => {
+      if (mediaFilter !== 'all') {
+        const hasMediaMatch =
+          g.media_type === mediaFilter ||
+          (mediaFilter === 'text' &&
+            Array.isArray(g.outputs) &&
+            g.outputs.some((o) => o.media_type === 'text'));
+        if (!hasMediaMatch) return false;
+      }
       if (categoryFilter !== 'all' && g.category_name !== categoryFilter) return false;
       if (workflowFilter !== 'all' && String(g.workflow_id) !== workflowFilter) return false;
       if (q) {
-        const hay = `${g.workflow_name} ${g.category_name} ${g.prompt_id} ${JSON.stringify(g.submitted_inputs)}`.toLowerCase();
+        const outputsText = (g.outputs || []).map((o) => o.text_content || '').join(' ');
+        const hay = `${g.workflow_name} ${g.category_name} ${g.prompt_id} ${JSON.stringify(g.submitted_inputs)} ${outputsText}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -166,7 +196,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       }
       return timeDiff !== 0 ? -timeDiff : b.id - a.id;
     });
-  }, [generations, mediaFilter, categoryFilter, workflowFilter, sortBy, search]);
+  }, [safeGenerations, mediaFilter, categoryFilter, workflowFilter, sortBy, search]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -243,18 +273,18 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       <div className="px-6 py-3.5 border-b border-zinc-800/80 bg-[#12151B] flex flex-wrap items-center justify-between gap-3 shrink-0">
         <div className="flex flex-wrap items-center gap-2.5">
           <div className="flex items-center gap-1 p-1 bg-[#0B0D11] border border-zinc-800 rounded-md">
-            {(['all', 'image', 'video'] as const).map((tab) => (
+            {(['all', 'image', 'video', 'text'] as const).map((tab) => (
               <button
                 key={tab}
                 type="button"
                 onClick={() => setMediaFilter(tab)}
-                className={`px-3 py-1 text-xs font-medium rounded transition-colors capitalize cursor-pointer ${
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
                   mediaFilter === tab
                     ? 'bg-zinc-800 text-zinc-100'
                     : 'text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                {tab === 'all' ? 'All Media' : `${tab}s`}
+                {tab === 'all' ? 'All Media' : tab === 'text' ? 'Text' : `${tab}s`.replace(/^[a-z]/, (c) => c.toUpperCase())}
               </button>
             ))}
           </div>
@@ -352,19 +382,29 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             {filtered.map((item) => {
               const primary = item.outputs[0];
               const isVideo = item.media_type === 'video' || primary?.media_type === 'video';
+              const isText = item.media_type === 'text' || primary?.media_type === 'text';
               const hasInputs = Boolean(item.input_media && item.input_media.length > 0);
               const primaryMeta = primary
                 ? resolveMediaMeta(primary, measuredByUrl[primary.url])
                 : null;
-              const rightSpecParts = [
-                primaryMeta?.dimensionsText,
-                isVideo ? primaryMeta?.durationText : null,
-                primaryMeta?.fileSizeText || (primary?.format ? primary.format.toUpperCase() : item.media_type.toUpperCase()),
-              ].filter(Boolean) as string[];
+              const primaryTextStats = isText ? formatTextStats(primary?.text_content) : null;
+              const rightSpecParts = isText
+                ? [
+                    primary?.format ? primary.format.toUpperCase() : 'TXT',
+                    primaryTextStats,
+                    primaryMeta?.fileSizeText,
+                  ].filter(Boolean) as string[]
+                : ([
+                    primaryMeta?.dimensionsText,
+                    isVideo ? primaryMeta?.durationText : null,
+                    primaryMeta?.fileSizeText ||
+                      (primary?.format ? primary.format.toUpperCase() : item.media_type.toUpperCase()),
+                  ].filter(Boolean) as string[]);
               const rightSpecSummary = rightSpecParts.join(' · ');
               const fullTooltip = [
                 primaryMeta?.dimensionsText ? `Size: ${primaryMeta.dimensionsText}` : null,
                 isVideo && primaryMeta?.durationText ? `Duration: ${primaryMeta.durationText}` : null,
+                primaryTextStats ? `Text: ${primaryTextStats}` : null,
                 primaryMeta?.fileSizeText ? `File: ${primaryMeta.fileSizeText}` : null,
                 primary?.format ? `Format: ${primary.format.toUpperCase()}` : null,
                 item.outputs.length > 1 ? `${item.outputs.length} outputs` : null,
@@ -383,10 +423,24 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                     <button
                       type="button"
                       onClick={() => openDetailModal(item)}
-                      className="w-full h-full flex items-center justify-center p-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                      className={`w-full h-full flex cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                        isText ? 'flex-col items-stretch justify-start p-3.5 text-left' : 'items-center justify-center p-2'
+                      }`}
                       title="View details, inputs, and parameters"
                     >
-                      {primary?.url ? (
+                      {isText ? (
+                        <div className="w-full h-full flex flex-col min-h-0 overflow-hidden">
+                          <div className="flex items-center gap-1.5 text-[11px] font-mono text-zinc-400 pb-2 border-b border-zinc-800/70 pr-16 shrink-0">
+                            <FileText className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                            <span className="truncate">
+                              {primary?.original_filename || primary?.filename || 'output.txt'}
+                            </span>
+                          </div>
+                          <pre className="mt-2 flex-1 min-h-0 overflow-hidden text-[11px] font-mono text-zinc-200/95 whitespace-pre-wrap break-words leading-relaxed text-left">
+                            {primary?.text_content || '(Empty text output)'}
+                          </pre>
+                        </div>
+                      ) : primary?.url ? (
                         isVideo ? (
                           <video
                             src={primary.url}
@@ -440,24 +494,43 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                           <Film className="w-3.5 h-3.5" />
                         </span>
                       )}
-                      {primary?.url && (
+                      {isText && primary?.text_content != null && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleCopyText(primary.text_content || '', `card-${item.id}`);
+                          }}
+                          title="Copy text content"
+                          aria-label="Copy text content"
+                          className="p-1.5 rounded-md bg-black/75 hover:bg-zinc-800 border border-zinc-700/60 text-zinc-200 hover:text-white transition-colors cursor-pointer"
+                        >
+                          {copiedKey === `card-${item.id}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      )}
+                      {(primary?.url || (isText && primary?.text_content != null)) && (
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
                             openOriginalLightbox({
-                              url: primary.url,
+                              url: primary?.url || '',
                               title: item.workflow_name,
-                              filename: primary.original_filename || primary.filename,
-                              mediaType: isVideo ? 'video' : 'image',
+                              filename: primary?.original_filename || primary?.filename || 'output.txt',
+                              mediaType: isVideo ? 'video' : isText ? 'text' : 'image',
+                              textContent: primary?.text_content,
                               width: primaryMeta?.width,
                               height: primaryMeta?.height,
                               durationSeconds: primaryMeta?.durationSeconds,
                               fileSize: primaryMeta?.fileSize,
                             });
                           }}
-                          title="Open original size"
-                          aria-label="Open original size"
+                          title={isText ? 'Open full text viewer' : 'Open original size'}
+                          aria-label={isText ? 'Open full text viewer' : 'Open original size'}
                           className="p-1.5 rounded-md bg-black/75 hover:bg-blue-600 border border-zinc-700/60 hover:border-blue-500 text-zinc-200 hover:text-white transition-colors cursor-pointer"
                         >
                           <Maximize2 className="w-3.5 h-3.5" />
@@ -547,7 +620,62 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               {/* Left Output Viewport */}
               <div className="lg:col-span-7 bg-[#07090C] flex flex-col min-h-[280px] overflow-hidden border-b lg:border-b-0 lg:border-r border-zinc-800">
                 <div className="relative flex-1 min-h-0 flex items-center justify-center p-4 overflow-hidden">
-                  {activeOutput?.url ? (
+                  {activeOutput && activeOutput.media_type === 'text' ? (
+                    <div className="w-full h-full max-h-[62vh] rounded-md border border-zinc-800 bg-[#0B0D11] flex flex-col overflow-hidden">
+                      <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-[#12151B] flex items-center justify-between gap-2 shrink-0">
+                        <span className="inline-flex items-center gap-1.5 text-xs font-mono text-zinc-300 truncate">
+                          <FileText className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                          <span className="truncate">
+                            {activeOutput.original_filename || activeOutput.filename}
+                          </span>
+                        </span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleCopyText(
+                                activeOutput.text_content || '',
+                                `modal-${activeItem.id}-${selectedOutputIndex}`,
+                              )
+                            }
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded transition-colors cursor-pointer"
+                          >
+                            {copiedKey === `modal-${activeItem.id}-${selectedOutputIndex}` ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                Copy Text
+                              </>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openOriginalLightbox({
+                                url: activeOutput.url || '',
+                                title: activeItem.workflow_name,
+                                filename: activeOutput.original_filename || activeOutput.filename,
+                                mediaType: 'text',
+                                textContent: activeOutput.text_content,
+                                fileSize: activeOutputMeta?.fileSize,
+                              })
+                            }
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-blue-600/20 hover:bg-blue-600 border border-blue-500/40 text-blue-200 hover:text-white rounded transition-colors cursor-pointer"
+                          >
+                            <Maximize2 className="w-3.5 h-3.5" />
+                            Full Text
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="flex-1 min-h-0 overflow-auto p-4 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed select-text">
+                        {activeOutput.text_content ?? '(Empty text output)'}
+                      </pre>
+                    </div>
+                  ) : activeOutput?.url ? (
                     activeOutput.media_type === 'video' ? (
                       <video
                         key={activeOutput.url}
@@ -604,7 +732,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                     <span className="text-xs text-zinc-500">Output file unavailable</span>
                   )}
 
-                  {activeOutput?.url && (
+                  {activeOutput?.url && activeOutput.media_type !== 'text' && (
                     <button
                       type="button"
                       onClick={() =>
@@ -634,6 +762,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                         activeOutput.format.toUpperCase(),
                         activeOutputMeta?.dimensionsText,
                         activeOutput.media_type === 'video' ? activeOutputMeta?.durationText : null,
+                        activeOutput.media_type === 'text'
+                          ? formatTextStats(activeOutput.text_content)
+                          : null,
                         activeOutputMeta?.fileSizeText,
                       ]
                         .filter(Boolean)
@@ -652,7 +783,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                       const tabDetail =
                         out.media_type === 'video'
                           ? outMeta.durationText || outMeta.dimensionsText
-                          : outMeta.dimensionsText;
+                          : out.media_type === 'text'
+                            ? formatTextStats(out.text_content) || 'TXT'
+                            : outMeta.dimensionsText;
                       return (
                         <button
                           key={out.filename}
@@ -870,62 +1003,99 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               <span className="text-xs font-mono text-zinc-400 truncate hidden sm:inline">
                 {lightboxMedia.filename}
               </span>
-              {naturalSize && (
+              {lightboxMedia.mediaType === 'text' ? (
                 <span className="text-xs font-mono text-blue-400 tabular-nums shrink-0">
                   {[
-                    `${naturalSize.width} × ${naturalSize.height} px`,
-                    lightboxMedia.mediaType === 'video'
-                      ? formatVideoDuration(
-                          naturalSize.durationSeconds ?? lightboxMedia.durationSeconds,
-                        )
-                      : null,
+                    formatTextStats(lightboxMedia.textContent),
                     formatFileSize(lightboxMedia.fileSize),
                   ]
                     .filter(Boolean)
                     .join(' · ')}
                 </span>
+              ) : (
+                naturalSize && (
+                  <span className="text-xs font-mono text-blue-400 tabular-nums shrink-0">
+                    {[
+                      `${naturalSize.width} × ${naturalSize.height} px`,
+                      lightboxMedia.mediaType === 'video'
+                        ? formatVideoDuration(
+                            naturalSize.durationSeconds ?? lightboxMedia.durationSeconds,
+                          )
+                        : null,
+                      formatFileSize(lightboxMedia.fileSize),
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </span>
+                )
               )}
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() =>
-                  setLightboxMode((prev) => (prev === 'original' ? 'fit' : 'original'))
-                }
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors cursor-pointer"
-              >
-                {lightboxMode === 'original' ? (
-                  <>
-                    <Minimize2 className="w-3.5 h-3.5" />
-                    Fit Screen
-                  </>
-                ) : (
-                  <>
-                    <Maximize2 className="w-3.5 h-3.5" />
-                    Original Size (1:1)
-                  </>
-                )}
-              </button>
+              {lightboxMedia.mediaType === 'text' ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void handleCopyText(lightboxMedia.textContent || '', 'lightbox-text')
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors cursor-pointer"
+                >
+                  {copiedKey === 'lightbox-text' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      Copy Text
+                    </>
+                  )}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setLightboxMode((prev) => (prev === 'original' ? 'fit' : 'original'))
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors cursor-pointer"
+                >
+                  {lightboxMode === 'original' ? (
+                    <>
+                      <Minimize2 className="w-3.5 h-3.5" />
+                      Fit Screen
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 className="w-3.5 h-3.5" />
+                      Original Size (1:1)
+                    </>
+                  )}
+                </button>
+              )}
 
-              <a
-                href={lightboxMedia.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                Open Raw
-              </a>
+              {lightboxMedia.url && (
+                <>
+                  <a
+                    href={lightboxMedia.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    Open Raw
+                  </a>
 
-              <a
-                href={lightboxMedia.url}
-                download={lightboxMedia.filename}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white rounded-md transition-colors"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download
-              </a>
+                  <a
+                    href={lightboxMedia.url}
+                    download={lightboxMedia.filename}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white rounded-md transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download
+                  </a>
+                </>
+              )}
 
               <button
                 type="button"
@@ -942,7 +1112,16 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             className="flex-1 min-h-0 overflow-auto flex p-4"
             onClick={() => setLightboxMedia(null)}
           >
-            {lightboxMedia.mediaType === 'video' ? (
+            {lightboxMedia.mediaType === 'text' ? (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="m-auto w-full max-w-4xl max-h-full rounded-lg border border-zinc-800 bg-[#0B0D11] flex flex-col overflow-hidden shadow-2xl"
+              >
+                <pre className="flex-1 overflow-auto p-6 text-sm font-mono text-zinc-100 whitespace-pre-wrap break-words leading-relaxed select-text">
+                  {lightboxMedia.textContent ?? '(Empty text output)'}
+                </pre>
+              </div>
+            ) : lightboxMedia.mediaType === 'video' ? (
               <video
                 src={lightboxMedia.url}
                 controls

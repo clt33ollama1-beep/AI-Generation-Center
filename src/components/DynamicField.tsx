@@ -230,25 +230,39 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
         </label>
       )}
 
-      {field.widget === 'select' && (
-        <select
-          id={`field-${field.id}`}
-          value={String(value ?? '')}
-          onChange={(e) => {
-            const raw = e.target.value;
-            if (field.value_type === 'int') onChange(parseInt(raw, 10));
-            else if (field.value_type === 'float') onChange(parseFloat(raw));
-            else onChange(raw);
-          }}
-          className={`${inputBaseClass} cursor-pointer`}
-        >
-          {(field.options || []).map((opt) => (
-            <option key={opt} value={opt} className="bg-[#12151B] text-zinc-100">
-              {opt}
-            </option>
-          ))}
-        </select>
-      )}
+      {field.widget === 'select' && (() => {
+        const currentStr = String(value ?? '');
+        const baseOpts = field.options || [];
+        const renderedOpts =
+          currentStr !== '' && !baseOpts.includes(currentStr)
+            ? [currentStr, ...baseOpts]
+            : baseOpts;
+        return (
+          <select
+            id={`field-${field.id}`}
+            value={currentStr}
+            onChange={(e) => {
+              const raw = e.target.value;
+              if (field.value_type === 'int') {
+                const parsed = parseInt(raw, 10);
+                onChange(Number.isNaN(parsed) ? raw : parsed);
+              } else if (field.value_type === 'float') {
+                const parsed = parseFloat(raw);
+                onChange(Number.isNaN(parsed) ? raw : parsed);
+              } else {
+                onChange(raw);
+              }
+            }}
+            className={`${inputBaseClass} cursor-pointer`}
+          >
+            {renderedOpts.map((opt) => (
+              <option key={opt} value={opt} className="bg-[#12151B] text-zinc-100">
+                {opt}
+              </option>
+            ))}
+          </select>
+        );
+      })()}
 
       {field.widget === 'image_upload' && (
         <div className="space-y-2">

@@ -42,6 +42,25 @@ IMAGE_OUTPUT_NODE_TYPES = {
     "Image Comparer (rgthree)",
 }
 
+TEXT_OUTPUT_NODE_TYPES = {
+    "ShowText|pysssss",
+    "ShowText",
+    "Show Text",
+    "Display Text (rgthree)",
+    "DisplayText",
+    "PreviewText",
+    "PreviewTextNode",
+    "SaveText",
+    "SaveText|pysssss",
+    "SaveTextFile",
+    "PreviewAny",
+    "easy showAnything",
+    "DisplayAny",
+    "StringOutput",
+    "OutputString",
+    "Text Output",
+}
+
 PRIMARY_SINK_NODE_TYPES = {
     "SaveImage",
     "SaveImageAdvanced",
@@ -50,6 +69,19 @@ PRIMARY_SINK_NODE_TYPES = {
     "SaveWEBM",
     "SaveAnimatedWEBP",
     "SaveAnimatedPNG",
+    "ShowText|pysssss",
+    "ShowText",
+    "Show Text",
+    "Display Text (rgthree)",
+    "DisplayText",
+    "PreviewText",
+    "PreviewTextNode",
+    "SaveText",
+    "SaveText|pysssss",
+    "SaveTextFile",
+    "StringOutput",
+    "OutputString",
+    "Text Output",
 }
 
 
@@ -102,6 +134,13 @@ def _classify_output_node(
                 fmt = "apng"
             else:
                 fmt = "mp4"
+    elif (
+        class_type in TEXT_OUTPUT_NODE_TYPES
+        or fmt_lower.startswith("text/")
+        or fmt_lower in {"txt", "md", "markdown", "json", "csv", "srt", "vtt"}
+    ):
+        media_type = "text"
+        fmt = raw_format or "txt"
 
     meta = node.get("_meta")
     title = (
@@ -147,7 +186,11 @@ def extract_workflow_outputs(
         if not isinstance(node, dict):
             continue
         class_type = node.get("class_type")
-        if class_type in VIDEO_OUTPUT_NODE_TYPES or class_type in IMAGE_OUTPUT_NODE_TYPES:
+        if (
+            class_type in VIDEO_OUTPUT_NODE_TYPES
+            or class_type in IMAGE_OUTPUT_NODE_TYPES
+            or class_type in TEXT_OUTPUT_NODE_TYPES
+        ):
             outputs.append(_classify_output_node(node_id, node, node_id in primary_set))
             seen.add(node_id)
 
@@ -163,6 +206,8 @@ def extract_workflow_outputs(
         suggested_output_type = "video"
     elif any(o["media_type"] == "image" for o in effective_outputs):
         suggested_output_type = "image"
+    elif any(o["media_type"] == "text" for o in effective_outputs):
+        suggested_output_type = "text"
 
     suggested_output_node_ids = (
         [o["node_id"] for o in primary_outputs]

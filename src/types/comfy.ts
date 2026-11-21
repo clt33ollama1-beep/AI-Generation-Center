@@ -8,7 +8,7 @@ export type WidgetType =
   | 'select'
   | 'image_upload';
 
-export type OutputMediaType = 'auto' | 'image' | 'video';
+export type OutputMediaType = 'auto' | 'image' | 'video' | 'text';
 
 export interface UIInputField {
   id: string;
@@ -66,6 +66,7 @@ export interface InspectedInput {
   default_value: string | number | boolean;
   suggested_widget: WidgetType;
   is_media_input: boolean;
+  options?: string[];
 }
 
 export interface InspectedNode {
@@ -89,7 +90,7 @@ export interface InspectedOutput {
   node_id: string;
   class_type: string;
   title: string;
-  media_type: 'image' | 'video';
+  media_type: 'image' | 'video' | 'text';
   format: string;
   is_primary_app_output: boolean;
 }
@@ -114,13 +115,14 @@ export interface OutputFileInfo {
   filename: string;
   original_filename: string;
   url: string;
-  media_type: 'image' | 'video';
+  media_type: 'image' | 'video' | 'text';
   format: string;
   node_id: string;
   width?: number | null;
   height?: number | null;
   duration_seconds?: number | null;
   file_size?: number | null;
+  text_content?: string | null;
 }
 
 export interface InputMediaInfo {
@@ -147,7 +149,7 @@ export interface GenerationRecord {
   prompt_id: string;
   client_id: string;
   status: 'completed' | 'failed' | 'running';
-  media_type: 'image' | 'video';
+  media_type: 'image' | 'video' | 'text';
   primary_output_url: string;
   outputs: OutputFileInfo[];
   input_media?: InputMediaInfo[];

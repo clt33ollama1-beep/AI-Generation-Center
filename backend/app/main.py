@@ -31,7 +31,7 @@ from app.comfy_client import (
 from app.config import settings
 from app.converter import normalize_comfy_workflow_payload
 from app.database import engine, get_session, init_db
-from app.inspector import inspect_comfy_workflow
+from app.inspector import fetch_comfy_object_info, inspect_comfy_workflow
 from app.media_metadata import extract_media_metadata_from_file
 from app.models import (
     AppSetting,
@@ -156,7 +156,9 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
             except Exception:
                 continue
     raw_output_type = (wf.output_type or "auto").strip().lower()
-    safe_output_type = raw_output_type if raw_output_type in {"auto", "image", "video"} else "auto"
+    safe_output_type = (
+        raw_output_type if raw_output_type in {"auto", "image", "video", "text"} else "auto"
+    )
     return WorkflowRead(
         id=wf.id or 0,
         name=wf.name,
@@ -177,6 +179,25 @@ def _enrich_media_dict(item: dict[str, Any]) -> dict[str, Any]:
     if not filename:
         return item
     media_type = item.get("media_type")
+    if media_type == "text":
+        needs_text = item.get("text_content") is None
+        needs_size = item.get("file_size") is None
+        if not (needs_text or needs_size):
+            return item
+        safe_path = resolve_safe_outputs_path(str(filename))
+        if not safe_path or not safe_path.exists():
+            return item
+        enriched = dict(item)
+        if enriched.get("file_size") is None:
+            enriched["file_size"] = safe_path.stat().st_size
+        if enriched.get("text_content") is None:
+            try:
+                raw_bytes = safe_path.read_bytes()[:262144]
+                enriched["text_content"] = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                enriched["text_content"] = None
+        return enriched
+
     needs_dims = item.get("width") is None or item.get("height") is None
     needs_dur = media_type == "video" and item.get("duration_seconds") is None
     needs_size = item.get("file_size") is None
@@ -370,10 +391,19 @@ def delete_category(category_id: int, session: Session = Depends(get_session)):
 
 
 @app.post("/api/workflows/inspect", response_model=WorkflowInspectResponse)
-def inspect_workflow(payload: WorkflowInspectRequest):
+async def inspect_workflow(
+    payload: WorkflowInspectRequest, session: Session = Depends(get_session)
+):
     try:
         normalized = normalize_comfy_workflow_payload(payload.comfy_api_json)
-        nodes = inspect_comfy_workflow(normalized["workflow"])
+        class_types = [
+            node.get("class_type")
+            for node in normalized["workflow"].values()
+            if isinstance(node, dict) and isinstance(node.get("class_type"), str)
+        ]
+        comfy_url = get_comfyui_url(session)
+        object_info = await fetch_comfy_object_info(comfy_url, class_types)
+        nodes = inspect_comfy_workflow(normalized["workflow"], object_info=object_info)
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Invalid ComfyUI workflow JSON: {exc}"
@@ -527,7 +557,7 @@ def list_generations(
         select(GenerationRecord).order_by(GenerationRecord.id.desc())  # type: ignore[union-attr]
     ).all()
     results = [to_generation_read(r) for r in rows]
-    if media_type in {"image", "video"}:
+    if media_type in {"image", "video", "text"}:
         results = [r for r in results if r.media_type == media_type]
     if workflow_id is not None:
         results = [r for r in results if r.workflow_id == workflow_id]
@@ -537,7 +567,7 @@ def list_generations(
             r
             for r in results
             if q
-            in f"{r.workflow_name} {r.category_name} {json.dumps(r.submitted_inputs)}".lower()
+            in f"{r.workflow_name} {r.category_name} {json.dumps(r.submitted_inputs)} {' '.join(o.text_content or '' for o in r.outputs)}".lower()
         ]
     return results
 

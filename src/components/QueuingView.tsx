@@ -20,6 +20,7 @@ import { api } from '../lib/api.ts';
 import {
   formatDimensions,
   formatFileSize,
+  formatTextStats,
   formatVideoDuration,
 } from '../lib/mediaMeta.ts';
 import type { QueueStatusResponse, QueueTaskItem } from '../types/comfy.ts';
@@ -300,11 +301,16 @@ export const QueuingView: React.FC<QueuingViewProps> = ({
                     primaryOut.media_type === 'video'
                       ? formatVideoDuration(primaryOut.duration_seconds)
                       : null;
+                  const txtStats =
+                    primaryOut.media_type === 'text'
+                      ? formatTextStats(primaryOut.text_content)
+                      : null;
                   const fSize = formatFileSize(primaryOut.file_size);
                   const summary = [
                     primaryOut.format?.toUpperCase(),
                     dims,
                     vidDur,
+                    txtStats,
                     fSize,
                   ]
                     .filter(Boolean)

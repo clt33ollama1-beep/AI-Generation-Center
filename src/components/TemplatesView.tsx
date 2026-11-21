@@ -89,6 +89,12 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       .replace(/\b\w/g, (c) => c.toUpperCase());
     const numDefault = typeof input.default_value === 'number' ? input.default_value : 0;
     const isNumeric = input.value_type === 'int' || input.value_type === 'float';
+    const selectOptions =
+      input.options && input.options.length > 0
+        ? input.options
+        : input.suggested_widget === 'select' && String(input.default_value ?? '') !== ''
+          ? [String(input.default_value)]
+          : undefined;
     return {
       id: key,
       node_id: node.node_id,
@@ -101,7 +107,7 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       min: input.suggested_widget === 'slider' ? Math.min(0, numDefault) : undefined,
       max: input.suggested_widget === 'slider' ? Math.max(100, numDefault) : undefined,
       step: isNumeric ? (input.value_type === 'float' ? 0.1 : 1) : undefined,
-      options: input.suggested_widget === 'select' ? [String(input.default_value)] : undefined,
+      options: input.suggested_widget === 'select' ? selectOptions : input.options,
       order,
     };
   };
@@ -792,9 +798,10 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                 onChange={(e) => setOutputType(e.target.value as OutputMediaType)}
                 className="w-full px-3 py-2 text-sm bg-[#12151B] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
               >
-                <option value="auto">Auto-Detect (Image / Video)</option>
+                <option value="auto">Auto-Detect (Image / Video / Text)</option>
                 <option value="image">Image (PNG / JPG / WEBP)</option>
                 <option value="video">Video (MP4 / WEBM / GIF)</option>
+                <option value="text">Text Content (TXT / Caption / String)</option>
               </select>
             </div>
 
@@ -1038,6 +1045,11 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                 <span className="text-[11px] font-mono text-zinc-500">
                                   ({inp.value_type})
                                 </span>
+                                {inp.options && inp.options.length > 0 && (
+                                  <span className="text-[11px] font-mono text-blue-400">
+                                    {inp.options.length} options
+                                  </span>
+                                )}
                               </label>
                               <span className="text-[11px] font-mono text-zinc-500 truncate max-w-xs">
                                 Default: {String(inp.default_value)}
@@ -1066,11 +1078,22 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                                   </label>
                                   <select
                                     value={mapped.widget}
-                                    onChange={(e) =>
-                                      updateMappedField(key, {
-                                        widget: e.target.value as WidgetType,
-                                      })
-                                    }
+                                    onChange={(e) => {
+                                      const nextWidget = e.target.value as WidgetType;
+                                      const patch: Partial<UIInputField> = { widget: nextWidget };
+                                      if (
+                                        nextWidget === 'select' &&
+                                        (!mapped.options || mapped.options.length === 0)
+                                      ) {
+                                        patch.options =
+                                          inp.options && inp.options.length > 0
+                                            ? inp.options
+                                            : String(mapped.default_value ?? '') !== ''
+                                              ? [String(mapped.default_value)]
+                                              : [];
+                                      }
+                                      updateMappedField(key, patch);
+                                    }}
                                     className="w-full px-2.5 py-1.5 text-xs bg-[#0B0D11] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
                                   >
                                     {WIDGET_OPTIONS.map((opt) => (
