@@ -35,6 +35,8 @@ class WorkflowTemplate(SQLModel, table=True):
     output_type: str = Field(default="auto")
     output_node_ids_json: str = Field(default="[]")
     comfy_api_json: str
+    raw_workflow_json: Optional[str] = Field(default=None)
+    source_filename: str = Field(default="")
     ui_inputs_json: str
     created_at: str = Field(default_factory=utcnow_iso)
     updated_at: str = Field(default_factory=utcnow_iso)

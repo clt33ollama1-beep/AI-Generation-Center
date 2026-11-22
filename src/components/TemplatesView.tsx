@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
+  Download,
   FileJson,
   FolderPlus,
   Pencil,
@@ -58,6 +59,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   const [outputType, setOutputType] = useState<OutputMediaType>('auto');
   const [outputNodeIds, setOutputNodeIds] = useState<string[]>([]);
   const [rawJsonText, setRawJsonText] = useState('');
+  const [sourceFilename, setSourceFilename] = useState('');
+  const [originalWorkflowJson, setOriginalWorkflowJson] = useState<Record<string, unknown> | null>(null);
+  const [originalWorkflowText, setOriginalWorkflowText] = useState<string | null>(null);
   const [parsedWorkflow, setParsedWorkflow] = useState<ComfyApiWorkflow | null>(null);
   const [inspectedNodes, setInspectedNodes] = useState<InspectedNode[]>([]);
   const [inspectedOutputs, setInspectedOutputs] = useState<InspectedOutput[]>([]);
@@ -143,6 +147,32 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     return autoMappedCount;
   };
 
+  const resolveDownloadFilename = (templateName: string, explicitFilename?: string | null) => {
+    const cleanedExplicit = (explicitFilename || '').trim();
+    if (cleanedExplicit) {
+      return cleanedExplicit.toLowerCase().endsWith('.json')
+        ? cleanedExplicit
+        : `${cleanedExplicit}.json`;
+    }
+    const safeName = (templateName || 'workflow')
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, '-')
+      .replace(/\s+/g, '_');
+    return `${safeName || 'workflow'}.json`;
+  };
+
+  const triggerDownloadJson = (content: string, filename: string) => {
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const startNewTemplate = () => {
     setEditingId(null);
     setName('');
@@ -151,6 +181,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     setOutputType('auto');
     setOutputNodeIds([]);
     setRawJsonText('');
+    setSourceFilename('');
+    setOriginalWorkflowJson(null);
+    setOriginalWorkflowText(null);
     setParsedWorkflow(null);
     setInspectedNodes([]);
     setInspectedOutputs([]);
@@ -180,6 +213,9 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
   }, [categories, categoryId]);
 
   const loadTemplateForEdit = async (wf: WorkflowTemplate) => {
+    const originalObj = (wf.raw_workflow_json || wf.comfy_api_json) as Record<string, unknown>;
+    const originalText = wf.raw_workflow_text || JSON.stringify(originalObj, null, 2);
+
     setEditingId(wf.id);
     setName(wf.name);
     setDescription(wf.description);
@@ -190,7 +226,10 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     setOutputType(wf.output_type);
     setOutputNodeIds(wf.output_node_ids || []);
     setParsedWorkflow(wf.comfy_api_json);
-    setRawJsonText(JSON.stringify(wf.comfy_api_json, null, 2));
+    setOriginalWorkflowJson(wf.raw_workflow_json || originalObj);
+    setOriginalWorkflowText(originalText);
+    setSourceFilename(wf.source_filename || '');
+    setRawJsonText(originalText);
     setAppInputs([]);
     setLastInspectRes(null);
     setError(null);
@@ -204,7 +243,10 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
 
     try {
       setInspecting(true);
-      const res = await api.inspectWorkflow(wf.comfy_api_json);
+      const res = await api.inspectWorkflow(originalObj);
+      if (res.converted_api_json && Object.keys(res.converted_api_json).length > 0) {
+        setParsedWorkflow(res.converted_api_json);
+      }
       setInspectedNodes(res.nodes);
       setInspectedOutputs(res.outputs || []);
       setAppInputs(res.app_inputs || []);
@@ -237,6 +279,8 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     try {
       const res = await api.inspectWorkflow(parsed);
       const executableWorkflow = (res.converted_api_json || parsed) as ComfyApiWorkflow;
+      setOriginalWorkflowJson(parsed);
+      setOriginalWorkflowText(jsonString);
       setParsedWorkflow(executableWorkflow);
       setInspectedNodes(res.nodes);
       setInspectedOutputs(res.outputs || []);
@@ -278,7 +322,10 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     const text = await file.text();
+    e.target.value = '';
     setRawJsonText(text);
+    setSourceFilename(file.name);
+    setOriginalWorkflowText(text);
     if (!name.trim()) {
       setName(file.name.replace(/(\.app)?\.json$/i, ''));
     }
@@ -327,7 +374,24 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
       setError('Select or create a valid category');
       return;
     }
-    if (!parsedWorkflow) {
+    let apiPayload: ComfyApiWorkflow | Record<string, unknown> | null = parsedWorkflow;
+    let rawJsonPayload = originalWorkflowJson;
+    let rawTextPayload = originalWorkflowText;
+
+    if (rawJsonText.trim() && rawJsonText !== originalWorkflowText) {
+      try {
+        const editedParsed = JSON.parse(rawJsonText) as unknown;
+        if (editedParsed && typeof editedParsed === 'object' && !Array.isArray(editedParsed)) {
+          rawJsonPayload = editedParsed as Record<string, unknown>;
+          rawTextPayload = rawJsonText;
+          apiPayload = editedParsed as Record<string, unknown>;
+        }
+      } catch {
+        // Keep last inspected valid payload if user left unparsed draft text
+      }
+    }
+
+    if (!apiPayload) {
       setError('Inspect a valid ComfyUI API JSON workflow first');
       return;
     }
@@ -342,9 +406,16 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           category_id: categoryId,
           output_type: outputType,
           output_node_ids: outputNodeIds,
-          comfy_api_json: parsedWorkflow,
+          comfy_api_json: apiPayload as ComfyApiWorkflow,
+          raw_workflow_json: rawJsonPayload,
+          raw_workflow_text: rawTextPayload,
+          source_filename: sourceFilename || null,
           ui_inputs: uiInputs,
         });
+        setParsedWorkflow(updated.comfy_api_json);
+        setOriginalWorkflowJson(updated.raw_workflow_json || rawJsonPayload);
+        setOriginalWorkflowText(updated.raw_workflow_text || rawTextPayload);
+        setSourceFilename(updated.source_filename || sourceFilename);
         await onRefreshData();
         setNotice(`Saved changes to "${updated.name}".`);
       } else {
@@ -354,10 +425,17 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           category_id: categoryId,
           output_type: outputType,
           output_node_ids: outputNodeIds,
-          comfy_api_json: parsedWorkflow,
+          comfy_api_json: apiPayload as ComfyApiWorkflow,
+          raw_workflow_json: rawJsonPayload,
+          raw_workflow_text: rawTextPayload,
+          source_filename: sourceFilename || null,
           ui_inputs: uiInputs,
         });
         setEditingId(created.id);
+        setParsedWorkflow(created.comfy_api_json);
+        setOriginalWorkflowJson(created.raw_workflow_json || rawJsonPayload);
+        setOriginalWorkflowText(created.raw_workflow_text || rawTextPayload);
+        setSourceFilename(created.source_filename || sourceFilename);
         await onRefreshData();
         setNotice(`Created template "${created.name}".`);
       }
@@ -654,14 +732,26 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
                         >
                           {wf.name}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleDeleteTemplate(wf.id, wf.name)}
-                          title="Delete template"
-                          className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 transition-opacity cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                          <a
+                            href={api.getWorkflowDownloadUrl(wf.id)}
+                            download={resolveDownloadFilename(wf.name, wf.source_filename)}
+                            title="Download original JSON"
+                            aria-label={`Download ${wf.name} original JSON`}
+                            className="p-0.5 text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteTemplate(wf.id, wf.name)}
+                            title="Delete template"
+                            aria-label={`Delete ${wf.name}`}
+                            className="p-0.5 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </div>
                     ))
                   )}
@@ -822,14 +912,41 @@ export const TemplatesView: React.FC<TemplatesViewProps> = ({
           {/* ComfyUI API JSON Upload / Paste */}
           <div className="rounded-lg border border-zinc-800 bg-[#12151B] p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <FileJson className="w-4 h-4 text-zinc-400" />
+              <div className="flex items-center gap-2 min-w-0">
+                <FileJson className="w-4 h-4 text-zinc-400 shrink-0" />
                 <h3 className="text-sm font-semibold text-zinc-100">
                   ComfyUI Workflow / API JSON
                 </h3>
+                {sourceFilename && (
+                  <span className="text-xs font-mono text-zinc-500 truncate max-w-[220px]" title={sourceFilename}>
+                    ({sourceFilename})
+                  </span>
+                )}
               </div>
 
-              <div className="flex items-center gap-2.5">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={!rawJsonText.trim() && !editingId}
+                  onClick={() => {
+                    const filename = resolveDownloadFilename(name, sourceFilename);
+                    if (rawJsonText.trim()) {
+                      triggerDownloadJson(rawJsonText, filename);
+                    } else if (editingId) {
+                      const link = document.createElement('a');
+                      link.href = api.getWorkflowDownloadUrl(editingId);
+                      link.download = filename;
+                      document.body.appendChild(link);
+                      link.click();
+                      link.remove();
+                    }
+                  }}
+                  title="Download original workflow JSON"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download .json
+                </button>
                 <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors cursor-pointer">
                   <Upload className="w-3.5 h-3.5" />
                   Upload .json

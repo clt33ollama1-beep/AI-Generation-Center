@@ -55,6 +55,9 @@ export interface WorkflowTemplate {
   output_type: OutputMediaType;
   output_node_ids: string[];
   comfy_api_json: ComfyApiWorkflow;
+  raw_workflow_json?: Record<string, unknown> | null;
+  raw_workflow_text?: string | null;
+  source_filename?: string | null;
   ui_inputs: UIInputField[];
   created_at: string;
   updated_at: string;

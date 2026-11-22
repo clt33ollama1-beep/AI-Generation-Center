@@ -121,6 +121,9 @@ class WorkflowCreate(BaseModel):
     output_type: OutputMediaType = "auto"
     output_node_ids: Optional[list[str]] = None
     comfy_api_json: dict[str, Any]
+    raw_workflow_json: Optional[dict[str, Any]] = None
+    raw_workflow_text: Optional[str] = None
+    source_filename: Optional[str] = None
     ui_inputs: list[UIInputField] = Field(default_factory=list)
 
 
@@ -131,6 +134,9 @@ class WorkflowUpdate(BaseModel):
     output_type: Optional[OutputMediaType] = None
     output_node_ids: Optional[list[str]] = None
     comfy_api_json: Optional[dict[str, Any]] = None
+    raw_workflow_json: Optional[dict[str, Any]] = None
+    raw_workflow_text: Optional[str] = None
+    source_filename: Optional[str] = None
     ui_inputs: Optional[list[UIInputField]] = None
 
 
@@ -143,6 +149,9 @@ class WorkflowRead(BaseModel):
     output_type: OutputMediaType
     output_node_ids: list[str] = Field(default_factory=list)
     comfy_api_json: dict[str, Any]
+    raw_workflow_json: Optional[dict[str, Any]] = None
+    raw_workflow_text: Optional[str] = None
+    source_filename: Optional[str] = None
     ui_inputs: list[UIInputField]
     created_at: str
     updated_at: str

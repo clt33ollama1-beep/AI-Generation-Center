@@ -29,6 +29,14 @@ def init_db() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE workflows ADD COLUMN output_node_ids_json TEXT NOT NULL DEFAULT '[]'"
             )
+        if "raw_workflow_json" not in col_names:
+            conn.exec_driver_sql(
+                "ALTER TABLE workflows ADD COLUMN raw_workflow_json TEXT"
+            )
+        if "source_filename" not in col_names:
+            conn.exec_driver_sql(
+                "ALTER TABLE workflows ADD COLUMN source_filename TEXT NOT NULL DEFAULT ''"
+            )
         gen_cols = conn.exec_driver_sql("PRAGMA table_info(generations)").fetchall()
         gen_col_names = {row[1] for row in gen_cols}
         if "input_media_json" not in gen_col_names:

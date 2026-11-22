@@ -7,9 +7,10 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+from urllib.parse import quote
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 from starlette.datastructures import UploadFile
@@ -139,6 +140,43 @@ def get_comfyui_url(session: Session) -> str:
     return (row.value if row else settings.comfyui_url).rstrip("/")
 
 
+def _resolve_raw_workflow_storage(
+    raw_text: Optional[str],
+    raw_json: Optional[dict[str, Any]],
+    fallback_input_json: Optional[dict[str, Any]] = None,
+    source_format: str = "api",
+) -> Optional[str]:
+    if raw_text is not None and raw_text.strip():
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, dict):
+                return raw_text
+        except Exception:
+            pass
+    if isinstance(raw_json, dict) and raw_json:
+        return json.dumps(raw_json, ensure_ascii=False, indent=2)
+    if source_format == "workflow" and isinstance(fallback_input_json, dict) and fallback_input_json:
+        return json.dumps(fallback_input_json, ensure_ascii=False, indent=2)
+    return None
+
+
+def _build_json_download_filename(source_filename: Optional[str], template_name: str) -> str:
+    candidate = (source_filename or "").strip()
+    if candidate:
+        candidate = Path(candidate).name
+        if not candidate.lower().endswith(".json"):
+            candidate = f"{candidate}.json"
+        return candidate
+    return f"{slugify(template_name or 'workflow')}.json"
+
+
+def _build_content_disposition(filename: str) -> str:
+    ascii_fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._") or "workflow.json"
+    if not ascii_fallback.lower().endswith(".json"):
+        ascii_fallback = f"{ascii_fallback}.json"
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quote(filename)}'
+
+
 def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
     ui_inputs_raw = safe_json_loads(wf.ui_inputs_json, [])
     if not isinstance(ui_inputs_raw, list):
@@ -148,6 +186,15 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
     comfy_api_raw = safe_json_loads(wf.comfy_api_json, {})
     if not isinstance(comfy_api_raw, dict):
         comfy_api_raw = {}
+    raw_text = getattr(wf, "raw_workflow_json", None)
+    raw_json_obj: Optional[dict[str, Any]] = None
+    raw_text_out: Optional[str] = None
+    if isinstance(raw_text, str) and raw_text.strip():
+        parsed_raw = safe_json_loads(raw_text, None)
+        if isinstance(parsed_raw, dict):
+            raw_json_obj = parsed_raw
+            raw_text_out = raw_text
+    source_filename = (getattr(wf, "source_filename", "") or "").strip() or None
     parsed_ui_inputs: list[UIInputField] = []
     for item in ui_inputs_raw:
         if isinstance(item, dict):
@@ -168,6 +215,9 @@ def to_workflow_read(wf: WorkflowTemplate, category_name: str) -> WorkflowRead:
         output_type=safe_output_type,  # type: ignore[arg-type]
         output_node_ids=output_node_ids,
         comfy_api_json=comfy_api_raw,
+        raw_workflow_json=raw_json_obj,
+        raw_workflow_text=raw_text_out,
+        source_filename=source_filename,
         ui_inputs=parsed_ui_inputs,
         created_at=wf.created_at,
         updated_at=wf.updated_at,
@@ -437,6 +487,25 @@ def get_workflow(workflow_id: int, session: Session = Depends(get_session)):
     return to_workflow_read(wf, cat.name if cat else "Uncategorized")
 
 
+@app.get("/api/workflows/{workflow_id}/download")
+def download_workflow_json(workflow_id: int, session: Session = Depends(get_session)):
+    wf = session.get(WorkflowTemplate, workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow template not found")
+    raw_text = (wf.raw_workflow_json or "").strip()
+    if raw_text:
+        content = wf.raw_workflow_json or ""
+    else:
+        api_obj = safe_json_loads(wf.comfy_api_json, {})
+        content = json.dumps(api_obj, ensure_ascii=False, indent=2)
+    filename = _build_json_download_filename(wf.source_filename, wf.name)
+    return Response(
+        content=content,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": _build_content_disposition(filename)},
+    )
+
+
 @app.post("/api/workflows", response_model=WorkflowRead, status_code=201)
 def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_session)):
     cleaned_name = payload.name.strip()
@@ -459,6 +528,13 @@ def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_sess
         if payload.output_node_ids is not None
         else normalized["suggested_output_node_ids"]
     )
+    raw_storage = _resolve_raw_workflow_storage(
+        payload.raw_workflow_text,
+        payload.raw_workflow_json,
+        payload.comfy_api_json,
+        normalized["source_format"],
+    )
+    cleaned_source_filename = (payload.source_filename or "").strip()
     wf = WorkflowTemplate(
         name=cleaned_name,
         description=payload.description.strip(),
@@ -466,6 +542,8 @@ def create_workflow(payload: WorkflowCreate, session: Session = Depends(get_sess
         output_type=payload.output_type or normalized["suggested_output_type"],
         output_node_ids_json=json.dumps(output_node_ids),
         comfy_api_json=json.dumps(normalized["workflow"]),
+        raw_workflow_json=raw_storage,
+        source_filename=cleaned_source_filename,
         ui_inputs_json=json.dumps([item.model_dump() for item in payload.ui_inputs]),
     )
     session.add(wf)
@@ -514,6 +592,16 @@ def update_workflow(
             ) from exc
     if normalized is not None:
         wf.comfy_api_json = json.dumps(normalized["workflow"])
+    raw_storage = _resolve_raw_workflow_storage(
+        payload.raw_workflow_text,
+        payload.raw_workflow_json,
+        payload.comfy_api_json if normalized is not None else None,
+        normalized["source_format"] if normalized is not None else "api",
+    )
+    if raw_storage is not None:
+        wf.raw_workflow_json = raw_storage
+    if payload.source_filename is not None:
+        wf.source_filename = payload.source_filename.strip()
     if payload.output_node_ids is not None:
         wf.output_node_ids_json = json.dumps([str(x) for x in payload.output_node_ids])
     elif (

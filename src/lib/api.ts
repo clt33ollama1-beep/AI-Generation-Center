@@ -80,6 +80,9 @@ export const api = {
     output_type: OutputMediaType;
     output_node_ids?: string[];
     comfy_api_json: ComfyApiWorkflow;
+    raw_workflow_json?: Record<string, unknown> | null;
+    raw_workflow_text?: string | null;
+    source_filename?: string | null;
     ui_inputs: UIInputField[];
   }) =>
     requestJson<WorkflowTemplate>('/api/workflows', {
@@ -97,6 +100,9 @@ export const api = {
       output_type: OutputMediaType;
       output_node_ids?: string[];
       comfy_api_json: ComfyApiWorkflow;
+      raw_workflow_json?: Record<string, unknown> | null;
+      raw_workflow_text?: string | null;
+      source_filename?: string | null;
       ui_inputs: UIInputField[];
     },
   ) =>
@@ -108,6 +114,8 @@ export const api = {
 
   deleteWorkflow: (id: number) =>
     requestJson<{ deleted: boolean }>(`/api/workflows/${id}`, { method: 'DELETE' }),
+
+  getWorkflowDownloadUrl: (id: number) => `/api/workflows/${id}/download`,
 
   listGenerations: (params?: { media_type?: string; workflow_id?: number; search?: string }) => {
     const searchParams = new URLSearchParams();

@@ -86,6 +86,12 @@ const workflowCols = db.prepare('PRAGMA table_info(workflows)').all() as Array<{
 if (!workflowCols.some((c) => c.name === 'output_node_ids_json')) {
   db.exec("ALTER TABLE workflows ADD COLUMN output_node_ids_json TEXT NOT NULL DEFAULT '[]';");
 }
+if (!workflowCols.some((c) => c.name === 'raw_workflow_json')) {
+  db.exec('ALTER TABLE workflows ADD COLUMN raw_workflow_json TEXT;');
+}
+if (!workflowCols.some((c) => c.name === 'source_filename')) {
+  db.exec("ALTER TABLE workflows ADD COLUMN source_filename TEXT NOT NULL DEFAULT '';");
+}
 
 const generationCols = db.prepare('PRAGMA table_info(generations)').all() as Array<{ name: string }>;
 if (!generationCols.some((c) => c.name === 'input_media_json')) {
@@ -558,6 +564,54 @@ function safeJsonParse<T>(raw: unknown, fallback: T): T {
   }
 }
 
+function resolveRawWorkflowStorage(
+  rawText: unknown,
+  rawJson: unknown,
+  fallbackInputJson: unknown,
+  sourceFormat: string,
+): string | null {
+  if (typeof rawText === 'string' && rawText.trim()) {
+    try {
+      const parsed = JSON.parse(rawText) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return rawText;
+      }
+    } catch {
+      // ignore invalid JSON text
+    }
+  }
+  if (rawJson && typeof rawJson === 'object' && !Array.isArray(rawJson) && Object.keys(rawJson).length > 0) {
+    return JSON.stringify(rawJson, null, 2);
+  }
+  if (
+    sourceFormat === 'workflow' &&
+    fallbackInputJson &&
+    typeof fallbackInputJson === 'object' &&
+    !Array.isArray(fallbackInputJson)
+  ) {
+    return JSON.stringify(fallbackInputJson, null, 2);
+  }
+  return null;
+}
+
+function buildJsonDownloadFilename(sourceFilename: unknown, templateName: string): string {
+  const candidate = String(sourceFilename || '').trim();
+  if (candidate) {
+    const base = path.basename(candidate);
+    return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
+  }
+  return `${slugify(templateName || 'workflow')}.json`;
+}
+
+function buildContentDisposition(filename: string): string {
+  const asciiFallback =
+    filename.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+|[._]+$/g, '') || 'workflow.json';
+  const safeAscii = asciiFallback.toLowerCase().endsWith('.json')
+    ? asciiFallback
+    : `${asciiFallback}.json`;
+  return `attachment; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
 function mapWorkflowRow(row: Record<string, unknown>) {
   let outputNodeIds: string[] = [];
   const parsedOutputIds = safeJsonParse<unknown>(row.output_node_ids_json, []);
@@ -565,6 +619,17 @@ function mapWorkflowRow(row: Record<string, unknown>) {
     outputNodeIds = parsedOutputIds.map((id) => String(id));
   }
   const comfyApiJson = safeJsonParse<ComfyApiWorkflow>(row.comfy_api_json, {});
+  const rawWorkflowTextStr = typeof row.raw_workflow_json === 'string' ? row.raw_workflow_json : null;
+  let rawWorkflowJson: Record<string, unknown> | null = null;
+  let rawWorkflowText: string | null = null;
+  if (rawWorkflowTextStr && rawWorkflowTextStr.trim()) {
+    const parsedRaw = safeJsonParse<unknown>(rawWorkflowTextStr, null);
+    if (parsedRaw && typeof parsedRaw === 'object' && !Array.isArray(parsedRaw)) {
+      rawWorkflowJson = parsedRaw as Record<string, unknown>;
+      rawWorkflowText = rawWorkflowTextStr;
+    }
+  }
+  const sourceFilename = String(row.source_filename || '').trim() || null;
   const uiInputs = safeJsonParse<UIInputField[]>(row.ui_inputs_json, []);
   return {
     id: Number(row.id),
@@ -575,6 +640,9 @@ function mapWorkflowRow(row: Record<string, unknown>) {
     output_type: String(row.output_type || 'auto'),
     output_node_ids: outputNodeIds,
     comfy_api_json: comfyApiJson && typeof comfyApiJson === 'object' ? comfyApiJson : {},
+    raw_workflow_json: rawWorkflowJson,
+    raw_workflow_text: rawWorkflowText,
+    source_filename: sourceFilename,
     ui_inputs: Array.isArray(uiInputs) ? uiInputs : [],
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
@@ -1267,6 +1335,24 @@ app.get('/api/workflows/:id', (req: Request, res: Response) => {
   res.json(mapWorkflowRow(row));
 });
 
+app.get('/api/workflows/:id/download', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const row = db
+    .prepare('SELECT id, name, comfy_api_json, raw_workflow_json, source_filename FROM workflows WHERE id = ?')
+    .get(id) as Record<string, unknown> | undefined;
+  if (!row) {
+    res.status(404).json({ detail: 'Workflow template not found' });
+    return;
+  }
+  const rawStr = typeof row.raw_workflow_json === 'string' && row.raw_workflow_json.trim()
+    ? row.raw_workflow_json
+    : JSON.stringify(safeJsonParse<Record<string, unknown>>(row.comfy_api_json, {}), null, 2);
+  const filename = buildJsonDownloadFilename(row.source_filename, String(row.name || 'workflow'));
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', buildContentDisposition(filename));
+  res.send(rawStr);
+});
+
 app.post('/api/workflows', (req: Request, res: Response) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
@@ -1292,11 +1378,18 @@ app.post('/api/workflows', (req: Request, res: Response) => {
     const outputNodeIds = Array.isArray(req.body?.output_node_ids)
       ? req.body.output_node_ids.map((id: unknown) => String(id))
       : normalized.suggested_output_node_ids;
+    const rawStorage = resolveRawWorkflowStorage(
+      req.body?.raw_workflow_text,
+      req.body?.raw_workflow_json,
+      comfyApiJson,
+      normalized.source_format,
+    );
+    const sourceFilename = String(req.body?.source_filename || '').trim();
 
     const result = db
       .prepare(`
-        INSERT INTO workflows (name, description, category_id, output_type, output_node_ids_json, comfy_api_json, ui_inputs_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO workflows (name, description, category_id, output_type, output_node_ids_json, comfy_api_json, raw_workflow_json, source_filename, ui_inputs_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         name,
@@ -1305,6 +1398,8 @@ app.post('/api/workflows', (req: Request, res: Response) => {
         outputType,
         JSON.stringify(outputNodeIds),
         JSON.stringify(normalized.workflow),
+        rawStorage,
+        sourceFilename,
         JSON.stringify(uiInputs),
       );
 
@@ -1376,6 +1471,22 @@ app.put('/api/workflows/:id', (req: Request, res: Response) => {
     const comfyApiJson = normalized
       ? JSON.stringify(normalized.workflow)
       : String(existing.comfy_api_json);
+    const nextRawStorage = resolveRawWorkflowStorage(
+      req.body?.raw_workflow_text,
+      req.body?.raw_workflow_json,
+      normalized ? req.body.comfy_api_json : null,
+      normalized ? normalized.source_format : 'api',
+    );
+    const rawWorkflowJson =
+      nextRawStorage !== null
+        ? nextRawStorage
+        : typeof existing.raw_workflow_json === 'string'
+          ? existing.raw_workflow_json
+          : null;
+    const sourceFilename =
+      req.body?.source_filename !== undefined && req.body?.source_filename !== null
+        ? String(req.body.source_filename).trim()
+        : String(existing.source_filename || '');
     const outputNodeIdsJson = Array.isArray(req.body?.output_node_ids)
       ? JSON.stringify(req.body.output_node_ids.map((nid: unknown) => String(nid)))
       : normalized && normalized.suggested_output_node_ids.length > 0 && String(existing.output_node_ids_json || '[]') === '[]'
@@ -1387,9 +1498,9 @@ app.put('/api/workflows/:id', (req: Request, res: Response) => {
 
     db.prepare(`
       UPDATE workflows
-      SET name = ?, description = ?, category_id = ?, output_type = ?, output_node_ids_json = ?, comfy_api_json = ?, ui_inputs_json = ?, updated_at = datetime('now')
+      SET name = ?, description = ?, category_id = ?, output_type = ?, output_node_ids_json = ?, comfy_api_json = ?, raw_workflow_json = ?, source_filename = ?, ui_inputs_json = ?, updated_at = datetime('now')
       WHERE id = ?
-    `).run(name, description, categoryId, outputType, outputNodeIdsJson, comfyApiJson, uiInputsJson, id);
+    `).run(name, description, categoryId, outputType, outputNodeIdsJson, comfyApiJson, rawWorkflowJson, sourceFilename, uiInputsJson, id);
 
     const updated = db
       .prepare(`
